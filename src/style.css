@@ -1,0 +1,208 @@
+/* Colours come from colors.css (or the defaults in style.rs). Cards are cel-shaded: a thick
+ * outline and a hard shadow. */
+
+window.wakeshell {
+    background: transparent;
+    font-family: "JetBrains Mono";
+    font-size: 15px;
+    color: @fg;
+}
+
+window.wakeshell * {
+    outline: none;
+}
+
+.small { font-size: 13px; }
+.large { font-size: 17px; }
+.bold { font-weight: bold; }
+.dim { color: @fg_dim; }
+.muted { color: @fg_muted; }
+
+.card {
+    background: @bg;
+    border: 3px solid @accent;
+    border-radius: 12px;
+    box-shadow: 5px 5px 0 0 alpha(@shadow, 0.85);
+}
+
+.card-header {
+    background: @bg_alt;
+    border-radius: 9px 9px 0 0;
+    min-height: 52px;
+    padding: 0 20px;
+}
+
+.separator-line {
+    background: @bg_alt;
+    min-height: 1px;
+}
+
+text {
+    all: unset;
+    caret-color: @fg;
+    color: @fg;
+}
+text selection {
+    background: @accent;
+    color: @bg;
+}
+text placeholder {
+    color: @fg_muted;
+}
+
+.field {
+    background: @bg_alt;
+    border: 3px solid @bg_alt;
+    border-radius: 8px;
+    min-height: 38px;
+    padding: 0 16px;
+}
+.field.filled { border-color: @accent; }
+.field.failed { border-color: @urgent; }
+
+.dialog-button {
+    background: @bg_alt;
+    border: 1px solid @bg_alt;
+    border-radius: 6px;
+    padding: 7px 16px;
+    color: @fg;
+}
+.dialog-button:hover { border-color: @accent; }
+.dialog-button.primary {
+    background: @accent;
+    border-color: @accent;
+    color: @bg;
+    font-weight: bold;
+}
+.dialog-button.primary:hover { border-color: @fg; }
+
+.error-text { color: @urgent; }
+
+/* Wallpaper */
+window.wallpaper { background: @bg; }
+
+/* Bar */
+window.bar {
+    background: @bg;
+    font-weight: bold;
+}
+.tag {
+    min-width: 35px;
+    color: @fg_dim;
+    background: @bg;
+}
+.tag.occupied, .tag.viewed {
+    color: @fg;
+    background: @bg_alt;
+}
+.tag.urgent {
+    color: @urgent;
+    background: @bg_alt;
+}
+.tag .underline {
+    background: currentColor;
+    min-height: 2px;
+    margin: 0 4px;
+}
+.layout-symbol {
+    color: @fg_dim;
+    padding: 0 10px;
+}
+.title { margin: 0 12px 0 4px; }
+.title.unselected { color: @fg_dim; }
+.floating-box {
+    border: 1px solid currentColor;
+    min-width: 3px;
+    min-height: 3px;
+    margin: 3px 3px 0 0;
+}
+.status { margin-right: 10px; }
+.status .off { color: @fg_dim; }
+
+/* Launcher */
+.launcher-search {
+    min-height: 52px;
+    padding: 0 20px;
+}
+.launcher-prompt { color: @fg_dim; }
+.launcher-row {
+    min-height: 36px;
+    border-radius: 8px;
+    padding: 0 12px;
+}
+.launcher-row.current { background: @bg_alt; }
+.launcher-empty { color: @fg_dim; }
+
+.backdrop-dim { background: alpha(@bg, 0.55); }
+
+/* Power menu */
+.power-tile {
+    min-width: 144px;
+    min-height: 144px;
+    background: alpha(@bg_alt, 0.8);
+    border-color: @shadow;
+}
+.power-tile.current {
+    background: @bg_alt;
+    border-color: @accent;
+    color: @accent;
+}
+
+/* Volume popup */
+.osd { padding: 0 18px; }
+.osd.muted-osd { border-color: @bg_alt; color: @fg_dim; }
+.osd progressbar trough {
+    all: unset;
+    min-height: 6px;
+    border-radius: 3px;
+    background: @bg_alt;
+}
+.osd progressbar progress {
+    all: unset;
+    min-height: 6px;
+    border-radius: 3px;
+    background: @accent;
+}
+.osd.muted-osd progressbar progress { background: @fg_dim; }
+
+/* Notifications */
+.notification {
+    background: alpha(@bg, 0.96);
+    padding: 13px 17px;
+}
+.notification.low { border-color: @bg_alt; color: @fg_dim; }
+.notification.critical { border-color: @urgent; }
+.notification .app-name { color: @accent; }
+.notification.low .app-name { color: @fg_dim; }
+.notification-button {
+    background: @bg_alt;
+    border: 1px solid @bg_alt;
+    border-radius: 6px;
+    padding: 4px 12px;
+    color: @fg;
+}
+.notification-button:hover { border-color: @accent; }
+.notification-more {
+    background: @bg;
+    border: 1px solid @bg_alt;
+    border-radius: 6px;
+    padding: 4px 12px;
+    color: @fg_muted;
+}
+
+/* Share picker */
+.share-tile {
+    background: @bg;
+    border: 3px solid @bg_alt;
+    border-radius: 8px;
+    padding: 7px 9px;
+}
+.share-tile:hover {
+    background: @bg_alt;
+    border-color: @accent;
+}
+.share-preview {
+    background: shade(@bg, 0.8);
+    border-radius: 4px;
+    color: @fg_muted;
+}
