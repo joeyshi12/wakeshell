@@ -6,6 +6,7 @@ use std::{
     path::PathBuf,
 };
 
+#[derive(Debug)]
 pub struct Reply(async_channel::Sender<String>);
 
 impl Reply {
@@ -14,6 +15,7 @@ impl Reply {
     }
 }
 
+#[derive(Debug)]
 pub struct Request {
     pub args: Vec<String>,
     pub reply: Reply,

@@ -1,170 +1,227 @@
 // Power menu over a blurred copy of the screen.
-use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
-};
+use std::rc::Rc;
 
 use gtk::{gdk, prelude::*};
+use relm4::{RelmWidgetExt, factory::FactoryVecDeque, prelude::*};
 
-use crate::{backdrop, config::Config, icon::Icon, util};
-
-struct Ui {
-    window: gtk::Window,
-    tiles: Vec<gtk::Box>,
-    current: Cell<Option<usize>>,
-}
+use crate::{
+    backdrop,
+    config::Config,
+    icon::Icon,
+    util::{self, Events},
+};
 
 pub struct PowerMenu {
-    options: Vec<(&'static str, &'static str, Vec<String>)>,
-    on_open: Rc<dyn Fn()>,
-    ui: RefCell<Option<Rc<Ui>>>,
+    commands: Vec<Vec<String>>,
+    shown: bool,
+    tiles: FactoryVecDeque<Tile>,
+    current: Option<usize>,
+    uptime: String,
+}
+
+#[derive(Debug)]
+pub enum PowerMenuMsg {
+    Open,
+    Toggle,
+    Close,
+    Hover(usize),
+    Leave(usize),
+    Next,
+    Previous,
+    Activate,
+    Run(usize),
+}
+
+#[derive(Debug)]
+pub struct Shown(pub bool);
+
+fn key_action(key: gdk::Key) -> Option<PowerMenuMsg> {
+    Some(match key {
+        gdk::Key::Escape => PowerMenuMsg::Close,
+        gdk::Key::Right | gdk::Key::Tab | gdk::Key::l => PowerMenuMsg::Next,
+        gdk::Key::Left | gdk::Key::ISO_Left_Tab | gdk::Key::h => PowerMenuMsg::Previous,
+        gdk::Key::Return | gdk::Key::KP_Enter => PowerMenuMsg::Activate,
+        _ => return None,
+    })
+}
+
+#[relm4::component(pub)]
+impl SimpleComponent for PowerMenu {
+    type Init = Rc<Config>;
+    type Input = PowerMenuMsg;
+    type Output = Shown;
+
+    view! {
+        util::overlay_window("wakeshell-powermenu") -> gtk::Window {
+            on_key[sender] => move |key, _| {
+                let action = key_action(key);
+                let handled = action.is_some();
+                if let Some(action) = action {
+                    sender.input(action);
+                }
+                handled
+            },
+
+            #[name = "backdrop"]
+            #[wrap(Some)]
+            set_child = &backdrop::new() -> gtk::Overlay {
+                add_overlay = &gtk::Box {
+                    set_orientation: gtk::Orientation::Vertical,
+                    set_spacing: 32,
+                    set_halign: gtk::Align::Center,
+                    set_valign: gtk::Align::Center,
+
+                    #[local_ref]
+                    tiles -> gtk::Box {
+                        set_spacing: 28,
+                    },
+                    gtk::Label {
+                        add_css_class: "muted",
+                        #[watch]
+                        set_label: &model.uptime,
+                    },
+                },
+            },
+
+            #[watch]
+            set_visible: model.shown,
+        }
+    }
+
+    fn init(config: Rc<Config>, root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
+        let options = [
+            ("lock", "Lock", &config.lock),
+            ("log-out", "Log out", &config.logout),
+            ("moon", "Suspend", &config.suspend),
+            ("rotate-cw", "Reboot", &config.reboot),
+            ("power", "Shut down", &config.poweroff),
+        ];
+        let mut tiles = FactoryVecDeque::builder().launch(gtk::Box::default()).forward(sender.input_sender(), |msg| msg);
+        for (i, (icon, label, _)) in options.iter().enumerate() {
+            tiles.guard().push_back((i, *icon, *label));
+        }
+        let commands = options.iter().map(|(_, _, command)| (*command).clone()).collect();
+        let model = PowerMenu { commands, shown: false, tiles, current: None, uptime: String::new() };
+        let tiles = model.tiles.widget();
+        let widgets = view_output!();
+
+        let mut inside = Vec::new();
+        let mut tile = tiles.first_child();
+        while let Some(widget) = tile {
+            tile = widget.next_sibling();
+            inside.push(widget);
+        }
+        let close = sender.clone();
+        widgets.backdrop.on_click_outside(&inside, move || close.input(PowerMenuMsg::Close));
+        ComponentParts { model, widgets }
+    }
+
+    fn update(&mut self, msg: PowerMenuMsg, sender: ComponentSender<Self>) {
+        let n = self.commands.len();
+        let was_shown = self.shown;
+        match msg {
+            PowerMenuMsg::Open => self.open(),
+            PowerMenuMsg::Toggle if self.shown => self.shown = false,
+            PowerMenuMsg::Toggle => self.open(),
+            PowerMenuMsg::Close => self.shown = false,
+            PowerMenuMsg::Hover(i) => self.set_current(Some(i)),
+            PowerMenuMsg::Leave(i) if self.current == Some(i) => self.set_current(None),
+            PowerMenuMsg::Leave(_) => {}
+            PowerMenuMsg::Next => self.set_current(Some(self.current.map_or(0, |c| (c + 1) % n))),
+            PowerMenuMsg::Previous => self.set_current(Some(self.current.map_or(n - 1, |c| (c + n - 1) % n))),
+            PowerMenuMsg::Activate => {
+                if let Some(current) = self.current {
+                    self.run(current);
+                }
+            }
+            PowerMenuMsg::Run(i) => self.run(i),
+        }
+        if self.shown != was_shown {
+            let _ = sender.output(Shown(self.shown));
+        }
+    }
 }
 
 impl PowerMenu {
-    pub fn new(config: Rc<Config>, on_open: Rc<dyn Fn()>) -> Rc<PowerMenu> {
-        let options = vec![
-            ("lock", "Lock", config.lock.clone()),
-            ("log-out", "Log out", config.logout.clone()),
-            ("moon", "Suspend", config.suspend.clone()),
-            ("rotate-cw", "Reboot", config.reboot.clone()),
-            ("power", "Shut down", config.poweroff.clone()),
-        ];
-        Rc::new(PowerMenu { options, on_open, ui: RefCell::new(None) })
-    }
-
-    pub fn shown(&self) -> bool {
-        self.ui.borrow().is_some()
-    }
-
-    pub fn toggle(self: &Rc<Self>) {
-        if self.shown() {
-            self.close();
-        } else {
-            self.open();
-        }
-    }
-
-    pub fn close(&self) {
-        if let Some(ui) = self.ui.take() {
-            ui.window.destroy();
-        }
-    }
-
-    fn run(&self, index: usize) {
-        self.close();
-        util::spawn(&self.options[index].2);
-    }
-
-    fn set_current(&self, index: Option<usize>) {
-        let Some(ui) = self.ui.borrow().clone() else { return };
-        for (i, tile) in ui.tiles.iter().enumerate() {
-            if Some(i) == index {
-                tile.add_css_class("current");
-            } else {
-                tile.remove_css_class("current");
-            }
-        }
-        ui.current.set(index);
-    }
-
-    pub fn open(self: &Rc<Self>) {
-        if self.shown() {
+    fn open(&mut self) {
+        if self.shown {
             return;
         }
-        (self.on_open)();
-        let window = util::overlay_window("wakeshell-powermenu");
-
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 32);
-        content.set_halign(gtk::Align::Center);
-        content.set_valign(gtk::Align::Center);
-        content.set_opacity(0.0);
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 28);
-        content.append(&row);
-        let mut tiles = Vec::new();
-        for (i, (icon, label, _)) in self.options.iter().enumerate() {
-            let tile = gtk::Box::new(gtk::Orientation::Vertical, 10);
-            tile.add_css_class("card");
-            tile.add_css_class("power-tile");
-            let inner = gtk::Box::new(gtk::Orientation::Vertical, 10);
-            inner.set_valign(gtk::Align::Center);
-            inner.set_vexpand(true);
-            let icon = Icon::new(icon, 44);
-            icon.set_halign(gtk::Align::Center);
-            inner.append(&icon);
-            inner.append(&util::label(label, &["small", "bold"]));
-            tile.append(&inner);
-            util::hand_cursor(&tile);
-
-            let weak = Rc::downgrade(self);
-            util::on_pointer_moved(&tile, move |_, _| {
-                if let Some(menu) = weak.upgrade() {
-                    menu.set_current(Some(i));
-                }
-            });
-            let leave = gtk::EventControllerMotion::new();
-            let weak = Rc::downgrade(self);
-            leave.connect_leave(move |_| {
-                let Some(menu) = weak.upgrade() else { return };
-                let current = menu.ui.borrow().as_ref().and_then(|ui| ui.current.get());
-                if current == Some(i) {
-                    menu.set_current(None);
-                }
-            });
-            tile.add_controller(leave);
-            let weak = Rc::downgrade(self);
-            util::on_click(&tile, move |button| {
-                if button == 1
-                    && let Some(menu) = weak.upgrade() {
-                        menu.run(i);
-                    }
-            });
-            row.append(&tile);
-            tiles.push(tile);
-        }
-
         let seconds = std::fs::read_to_string("/proc/uptime")
             .ok()
             .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
             .unwrap_or(0.0) as u64;
-        let uptime = format!("Up {}h {}m. Esc to cancel.", seconds / 3600, seconds % 3600 / 60);
-        content.append(&util::label(&uptime, &["muted"]));
+        self.uptime = format!("Up {}h {}m. Esc to cancel.", seconds / 3600, seconds % 3600 / 60);
+        self.set_current(None);
+        self.shown = true;
+    }
 
-        let shown = content.clone();
-        let root = backdrop::wrap(&window, &content, move || shown.set_opacity(1.0));
-        window.set_child(Some(&root));
+    fn run(&mut self, index: usize) {
+        self.shown = false;
+        util::spawn(&self.commands[index]);
+    }
 
-        let weak = Rc::downgrade(self);
-        let inside: Vec<gtk::Widget> = tiles.iter().map(|t| t.clone().upcast()).collect();
-        util::on_click_outside(&root, &inside, move || {
-            if let Some(menu) = weak.upgrade() {
-                menu.close();
-            }
-        });
+    fn set_current(&mut self, index: Option<usize>) {
+        for (i, tile) in self.tiles.guard().iter_mut().enumerate() {
+            tile.current = Some(i) == index;
+        }
+        self.current = index;
+    }
+}
 
-        let weak = Rc::downgrade(self);
-        let n = self.options.len();
-        util::on_key(&window, move |key, _| {
-            let Some(menu) = weak.upgrade() else { return false };
-            let current = menu.ui.borrow().as_ref().and_then(|ui| ui.current.get());
-            match key {
-                gdk::Key::Escape => menu.close(),
-                gdk::Key::Right | gdk::Key::Tab | gdk::Key::l => {
-                    menu.set_current(Some(current.map_or(0, |c| (c + 1) % n)))
+struct Tile {
+    index: usize,
+    icon: &'static str,
+    label: &'static str,
+    current: bool,
+}
+
+#[relm4::factory]
+impl FactoryComponent for Tile {
+    type Init = (usize, &'static str, &'static str);
+    type Input = ();
+    type Output = PowerMenuMsg;
+    type CommandOutput = ();
+    type ParentWidget = gtk::Box;
+
+    view! {
+        gtk::Box {
+            set_orientation: gtk::Orientation::Vertical,
+            set_spacing: 10,
+            set_css_classes: &["card", "power-tile"],
+            #[watch]
+            set_class_active: ("current", self.current),
+            set_cursor_from_name: Some("pointer"),
+            on_pointer_moved[sender, index = self.index] => move |_, _| {
+                let _ = sender.output(PowerMenuMsg::Hover(index));
+            },
+            on_hover[sender, index = self.index] => move |inside| {
+                if !inside {
+                    let _ = sender.output(PowerMenuMsg::Leave(index));
                 }
-                gdk::Key::Left | gdk::Key::ISO_Left_Tab | gdk::Key::h => {
-                    menu.set_current(Some(current.map_or(n - 1, |c| (c + n - 1) % n)))
-                }
-                gdk::Key::Return | gdk::Key::KP_Enter => {
-                    if let Some(current) = current {
-                        menu.run(current);
-                    }
-                }
-                _ => return false,
-            }
-            true
-        });
+            },
+            on_left_click[sender, index = self.index] => move || {
+                let _ = sender.output(PowerMenuMsg::Run(index));
+            },
 
-        self.ui.replace(Some(Rc::new(Ui { window: window.clone(), tiles, current: Cell::new(None) })));
-        window.present();
+            gtk::Box {
+                set_orientation: gtk::Orientation::Vertical,
+                set_spacing: 10,
+                set_valign: gtk::Align::Center,
+                set_vexpand: true,
+
+                Icon::new(self.icon, 44) {
+                    set_halign: gtk::Align::Center,
+                },
+                gtk::Label {
+                    set_label: self.label,
+                    set_css_classes: &["small", "bold"],
+                },
+            },
+        }
+    }
+
+    fn init_model((index, icon, label): Self::Init, _: &DynamicIndex, _: FactorySender<Self>) -> Self {
+        Tile { index, icon, label, current: false }
     }
 }

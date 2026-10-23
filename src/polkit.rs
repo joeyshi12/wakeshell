@@ -1,15 +1,19 @@
 // Polkit authentication agent. Passwords go to polkit-agent-helper-1 through
 // /run/polkit/agent-helper.socket, or the setuid helper where there is no socket.
 use std::{
-    cell::{Cell, RefCell},
+    cell::Cell,
     collections::{HashMap, VecDeque},
-    rc::{Rc, Weak},
+    rc::Rc,
 };
 
 use gtk::{gdk, gio, glib, prelude::*};
+use relm4::{RelmWidgetExt, prelude::*};
 use zbus::zvariant::{OwnedValue, Value};
 
-use crate::{backdrop, util};
+use crate::{
+    backdrop,
+    util::{self, Events},
+};
 
 const AGENT_PATH: &str = "/org/wakeshell/PolicyKit1/AuthenticationAgent";
 const HELPER_SOCKET: &str = "/run/polkit/agent-helper.socket";
@@ -23,7 +27,8 @@ enum AgentError {
     Cancelled(String),
 }
 
-struct Request {
+#[derive(Debug)]
+pub struct Request {
     cookie: String,
     message: String,
     uids: Vec<u32>,
@@ -71,328 +76,401 @@ impl Agent {
     }
 }
 
-struct Dialog {
-    window: gtk::Window,
-    field: gtk::Box,
-    input: gtk::Text,
-    notice: gtk::Label,
-}
-
 struct Flow {
     request: Request,
-    dialog: Dialog,
     username: String,
-    helper_input: RefCell<Option<gio::OutputStream>>,
-    helper: RefCell<Option<glib::Object>>,
-    /// Bumped per helper session so stale ones stop reading
-    generation: Cell<u32>,
-    failed: Cell<bool>,
-    prompt: RefCell<String>,
+    /// Keeps the helper's socket or process
+    helper: Option<glib::Object>,
+    helper_input: Option<gio::OutputStream>,
+    waiting: bool,
+    failed: bool,
+    prompt: String,
+    echo: bool,
 }
 
 pub struct Polkit {
-    on_open: Rc<dyn Fn()>,
-    queue: RefCell<VecDeque<Request>>,
-    flow: RefCell<Option<Rc<Flow>>>,
-    _connection: RefCell<Option<zbus::Connection>>,
+    queue: VecDeque<Request>,
+    flow: Option<Flow>,
+    /// Bumped per helper session so stale ones stop reading
+    generation: Rc<Cell<u32>>,
+    password: gtk::EntryBuffer,
+    filled: bool,
+    notice: String,
+    notice_error: bool,
+    focus: Cell<bool>,
+    _connection: Option<zbus::Connection>,
 }
 
+#[derive(Debug)]
+pub enum PolkitMsg {
+    Connected(zbus::Connection),
+    Begin(Request),
+    CancelCookie(String),
+    Cancel,
+    Submit,
+    Changed,
+    Helper(u32, Helper),
+}
+
+#[derive(Debug)]
+pub enum Helper {
+    Started { keep: glib::Object, input: gio::OutputStream },
+    Line(String),
+    Failed(glib::Error),
+}
+
+#[derive(Debug)]
+pub struct Shown(pub bool);
+
 impl Polkit {
-    pub fn new(on_open: Rc<dyn Fn()>) -> Rc<Polkit> {
-        let polkit = Rc::new(Polkit {
-            on_open,
-            queue: RefCell::new(VecDeque::new()),
-            flow: RefCell::new(None),
-            _connection: RefCell::new(None),
-        });
-        let (sender, receiver) = async_channel::unbounded();
-        let weak = Rc::downgrade(&polkit);
+    fn placeholder(&self) -> String {
+        let Some(flow) = &self.flow else { return String::new() };
+        let prompt = flow.prompt.trim_end().trim_end_matches(':').trim_end();
+        if !flow.waiting {
+            "Checking...".into()
+        } else if prompt.is_empty() {
+            "Password".into()
+        } else {
+            prompt.into()
+        }
+    }
+
+    fn failed(&self) -> bool {
+        self.flow.as_ref().is_some_and(|f| f.failed) || self.notice_error
+    }
+}
+
+#[relm4::component(pub)]
+impl SimpleComponent for Polkit {
+    type Init = ();
+    type Input = PolkitMsg;
+    type Output = Shown;
+
+    view! {
+        util::overlay_window("wakeshell-polkit") -> gtk::Window {
+            on_key[sender] => move |key, _| {
+                let msg = match key {
+                    gdk::Key::Escape => PolkitMsg::Cancel,
+                    gdk::Key::Return | gdk::Key::KP_Enter => PolkitMsg::Submit,
+                    _ => return false,
+                };
+                sender.input(msg);
+                true
+            },
+
+            #[name = "backdrop"]
+            #[wrap(Some)]
+            set_child = &backdrop::new() -> gtk::Overlay {
+                #[name = "card"]
+                add_overlay = &gtk::Box {
+                    set_orientation: gtk::Orientation::Vertical,
+                    add_css_class: "card",
+                    set_halign: gtk::Align::Center,
+                    set_valign: gtk::Align::Center,
+                    set_size_request: (460, -1),
+
+                    gtk::Box {
+                        add_css_class: "card-header",
+                        gtk::Label {
+                            set_label: "Authentication required",
+                            set_css_classes: &["large", "bold"],
+                        },
+                    },
+
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Vertical,
+                        set_spacing: 12,
+                        set_margin_all: 20,
+
+                        gtk::Label {
+                            set_wrap: true,
+                            set_wrap_mode: gtk::pango::WrapMode::WordChar,
+                            set_xalign: 0.0,
+                            set_max_width_chars: 1,
+                            set_hexpand: true,
+                            #[watch]
+                            set_label: model.flow.as_ref().map_or("", |f| &f.request.message),
+                        },
+                        gtk::Box {
+                            add_css_class: "field",
+                            #[watch]
+                            set_class_active: ("filled", model.filled && !model.failed()),
+                            #[watch]
+                            set_class_active: ("failed", model.failed()),
+
+                            #[name = "input"]
+                            gtk::Text {
+                                set_buffer: &model.password,
+                                set_hexpand: true,
+                                set_valign: gtk::Align::Center,
+                                set_invisible_char: '•',
+                                connect_changed => PolkitMsg::Changed,
+                                #[watch]
+                                set_visibility: model.flow.as_ref().is_some_and(|f| f.echo),
+                                #[watch]
+                                set_placeholder_text: Some(&model.placeholder()),
+                                #[watch]
+                                set_editable: model.flow.as_ref().is_some_and(|f| f.waiting),
+                            },
+                        },
+                        gtk::Label {
+                            set_wrap: true,
+                            set_wrap_mode: gtk::pango::WrapMode::WordChar,
+                            set_xalign: 0.0,
+                            set_max_width_chars: 1,
+                            set_hexpand: true,
+                            set_css_classes: &["small", "muted"],
+                            #[watch]
+                            set_label: &model.notice,
+                            #[watch]
+                            set_visible: !model.notice.is_empty(),
+                            #[watch]
+                            set_class_active: ("error-text", model.notice_error),
+                        },
+                    },
+
+                    gtk::Box {
+                        add_css_class: "separator-line",
+                    },
+                    gtk::Box {
+                        set_spacing: 12,
+                        set_halign: gtk::Align::End,
+                        set_margin_top: 14,
+                        set_margin_bottom: 14,
+                        set_margin_end: 20,
+
+                        gtk::Label {
+                            set_label: "Cancel",
+                            add_css_class: "dialog-button",
+                            set_cursor_from_name: Some("pointer"),
+                            on_left_click[sender] => move || sender.input(PolkitMsg::Cancel),
+                        },
+                        gtk::Label {
+                            set_label: "Authenticate",
+                            set_css_classes: &["dialog-button", "primary"],
+                            set_cursor_from_name: Some("pointer"),
+                            on_left_click[sender] => move || sender.input(PolkitMsg::Submit),
+                        },
+                    },
+                },
+            },
+
+            #[watch]
+            set_visible: model.flow.is_some(),
+        }
+    }
+
+    fn init(_: (), root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
+        let model = Polkit {
+            queue: VecDeque::new(),
+            flow: None,
+            generation: Rc::new(Cell::new(0)),
+            password: gtk::EntryBuffer::default(),
+            filled: false,
+            notice: String::new(),
+            notice_error: false,
+            focus: Cell::new(false),
+            _connection: None,
+        };
+        let widgets = view_output!();
+        let cancel = sender.clone();
+        widgets.backdrop.on_click_outside(&[widgets.card.clone().upcast()], move || cancel.input(PolkitMsg::Cancel));
+
+        let (events, receiver) = async_channel::unbounded();
         glib::spawn_future_local(async move {
-            match register(Agent { events: sender }).await {
-                Ok(connection) => {
-                    if let Some(polkit) = weak.upgrade() {
-                        polkit._connection.replace(Some(connection));
-                    }
-                }
+            match register(Agent { events }).await {
+                Ok(connection) => sender.input(PolkitMsg::Connected(connection)),
                 Err(e) => {
                     eprintln!("wakeshell: the polkit agent is off: {e}");
                     return;
                 }
             }
             while let Ok(event) = receiver.recv().await {
-                let Some(polkit) = weak.upgrade() else { return };
-                match event {
-                    Event::Begin(request) => {
-                        polkit.queue.borrow_mut().push_back(request);
-                        polkit.next();
-                    }
-                    Event::Cancel(cookie) => polkit.cancel_cookie(&cookie),
-                }
+                sender.input(match event {
+                    Event::Begin(request) => PolkitMsg::Begin(request),
+                    Event::Cancel(cookie) => PolkitMsg::CancelCookie(cookie),
+                });
             }
         });
-        polkit
+        ComponentParts { model, widgets }
     }
 
-    pub fn active(&self) -> bool {
-        self.flow.borrow().is_some()
+    fn post_view() {
+        if model.focus.take() {
+            input.grab_focus();
+        }
     }
 
-    fn next(self: &Rc<Self>) {
-        if self.active() {
+    fn update(&mut self, msg: PolkitMsg, sender: ComponentSender<Self>) {
+        let was_active = self.flow.is_some();
+        match msg {
+            PolkitMsg::Connected(connection) => self._connection = Some(connection),
+            PolkitMsg::Begin(request) => {
+                self.queue.push_back(request);
+                self.next(&sender);
+            }
+            PolkitMsg::CancelCookie(cookie) => {
+                if self.flow.as_ref().is_some_and(|f| f.request.cookie == cookie) {
+                    self.finish(false, &sender);
+                } else {
+                    self.queue.retain(|r| {
+                        let cancelled = r.cookie == cookie;
+                        if cancelled {
+                            let _ = r.done.try_send(false);
+                        }
+                        !cancelled
+                    });
+                }
+            }
+            PolkitMsg::Cancel => self.finish(false, &sender),
+            PolkitMsg::Submit => self.submit(),
+            PolkitMsg::Changed => self.filled = !self.password.text().is_empty(),
+            PolkitMsg::Helper(generation, event) if generation == self.generation.get() => {
+                self.helper_event(event, &sender)
+            }
+            PolkitMsg::Helper(..) => {}
+        }
+        if self.flow.is_some() != was_active {
+            let _ = sender.output(Shown(self.flow.is_some()));
+        }
+    }
+}
+
+impl Polkit {
+    fn next(&mut self, sender: &ComponentSender<Self>) {
+        if self.flow.is_some() {
             return;
         }
-        let Some(request) = self.queue.borrow_mut().pop_front() else { return };
-        let me = unsafe { libc::getuid() };
-        let uid = if request.uids.contains(&me) { Some(me) } else { request.uids.first().copied() };
-        let Some(username) = uid.and_then(username) else {
-            eprintln!("wakeshell: polkit asked for no user this agent can authenticate");
-            let _ = request.done.try_send(false);
-            return self.next();
-        };
-        (self.on_open)();
-        let dialog = self.build_dialog(&request.message);
-        let flow = Rc::new(Flow {
-            request,
-            dialog,
-            username,
-            helper_input: RefCell::new(None),
-            helper: RefCell::new(None),
-            generation: Cell::new(0),
-            failed: Cell::new(false),
-            prompt: RefCell::new(String::new()),
-        });
-        self.flow.replace(Some(flow.clone()));
-        update(&flow);
-        flow.dialog.window.present();
-        start_helper(Rc::downgrade(self), flow);
+        while let Some(request) = self.queue.pop_front() {
+            let me = unsafe { libc::getuid() };
+            let uid = if request.uids.contains(&me) { Some(me) } else { request.uids.first().copied() };
+            let Some(username) = uid.and_then(username) else {
+                eprintln!("wakeshell: polkit asked for no user this agent can authenticate");
+                let _ = request.done.try_send(false);
+                continue;
+            };
+            self.flow = Some(Flow {
+                request,
+                username,
+                helper: None,
+                helper_input: None,
+                waiting: false,
+                failed: false,
+                prompt: String::new(),
+                echo: false,
+            });
+            self.password.set_text("");
+            self.notice.clear();
+            self.notice_error = false;
+            self.focus.set(true);
+            self.start_helper(sender);
+            return;
+        }
     }
 
-    fn finish(self: &Rc<Self>, success: bool) {
+    fn finish(&mut self, success: bool, sender: &ComponentSender<Self>) {
         if let Some(flow) = self.flow.take() {
-            flow.generation.set(flow.generation.get() + 1);
-            flow.helper.take();
-            flow.helper_input.take();
-            flow.dialog.window.destroy();
+            self.generation.set(self.generation.get() + 1);
             let _ = flow.request.done.try_send(success);
         }
-        self.next();
+        self.next(sender);
     }
 
-    fn cancel(self: &Rc<Self>) {
-        self.finish(false);
-    }
-
-    fn cancel_cookie(self: &Rc<Self>, cookie: &str) {
-        let current = self.flow.borrow().as_ref().is_some_and(|f| f.request.cookie == cookie);
-        if current {
-            self.cancel();
-        } else {
-            self.queue.borrow_mut().retain(|r| {
-                let cancelled = r.cookie == cookie;
-                if cancelled {
-                    let _ = r.done.try_send(false);
-                }
-                !cancelled
-            });
-        }
-    }
-
-    fn submit(self: &Rc<Self>) {
-        let Some(flow) = self.flow.borrow().clone() else { return };
-        let password = flow.dialog.input.text().to_string();
-        let Some(stdin) = flow.helper_input.take() else { return };
-        if password.is_empty() {
-            flow.helper_input.replace(Some(stdin));
+    fn submit(&mut self) {
+        let Some(flow) = &mut self.flow else { return };
+        let password = self.password.text().to_string();
+        if !flow.waiting || password.is_empty() {
             return;
         }
-        flow.dialog.input.set_text("");
-        update(&flow);
+        let Some(stdin) = flow.helper_input.clone() else { return };
+        flow.waiting = false;
+        self.password.set_text("");
         glib::spawn_future_local(async move {
             let _ = stdin.write_all_future(password + "\n", glib::Priority::DEFAULT).await;
         });
     }
 
-    fn build_dialog(self: &Rc<Self>, message: &str) -> Dialog {
-        let window = util::overlay_window("wakeshell-polkit");
-
-        let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        card.add_css_class("card");
-        card.set_halign(gtk::Align::Center);
-        card.set_valign(gtk::Align::Center);
-        card.set_size_request(460, -1);
-        card.set_opacity(0.0);
-
-        let header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        header.add_css_class("card-header");
-        header.append(&util::label("Authentication required", &["large", "bold"]));
-        card.append(&header);
-
-        let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        body.set_margin_top(20);
-        body.set_margin_bottom(20);
-        body.set_margin_start(20);
-        body.set_margin_end(20);
-        body.append(&util::wrapping_label(message, &[]));
-        let field = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        field.add_css_class("field");
-        let input = gtk::Text::new();
-        input.set_hexpand(true);
-        input.set_valign(gtk::Align::Center);
-        input.set_visibility(false);
-        input.set_invisible_char('•');
-        field.append(&input);
-        body.append(&field);
-        let notice = util::wrapping_label("", &["small", "muted"]);
-        notice.set_visible(false);
-        body.append(&notice);
-        card.append(&body);
-
-        card.append(&util::separator());
-        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        buttons.set_halign(gtk::Align::End);
-        buttons.set_margin_top(14);
-        buttons.set_margin_bottom(14);
-        buttons.set_margin_end(20);
-        let weak = Rc::downgrade(self);
-        buttons.append(&util::dialog_button("Cancel", false, move || {
-            if let Some(polkit) = weak.upgrade() {
-                polkit.cancel();
-            }
-        }));
-        let weak = Rc::downgrade(self);
-        buttons.append(&util::dialog_button("Authenticate", true, move || {
-            if let Some(polkit) = weak.upgrade() {
-                polkit.submit();
-            }
-        }));
-        card.append(&buttons);
-
-        let shown = card.clone();
-        let root = backdrop::wrap(&window, &card, move || shown.set_opacity(1.0));
-        window.set_child(Some(&root));
-
-        let weak = Rc::downgrade(self);
-        util::on_click_outside(&root, &[card.clone().upcast()], move || {
-            if let Some(polkit) = weak.upgrade() {
-                polkit.cancel();
-            }
-        });
-        let weak = Rc::downgrade(self);
-        util::on_key(&window, move |key, _| {
-            let Some(polkit) = weak.upgrade() else { return false };
-            match key {
-                gdk::Key::Escape => polkit.cancel(),
-                gdk::Key::Return | gdk::Key::KP_Enter => polkit.submit(),
-                _ => return false,
-            }
-            true
-        });
-        let weak = Rc::downgrade(self);
-        input.connect_changed(move |_| {
-            if let Some(flow) = weak.upgrade().and_then(|p| p.flow.borrow().clone()) {
-                update(&flow);
-            }
-        });
-        input.grab_focus();
-        Dialog { window, field, input, notice }
+    fn set_notice(&mut self, text: &str, error: bool) {
+        self.notice = text.to_owned();
+        self.notice_error = error;
     }
-}
 
-fn update(flow: &Flow) {
-    let waiting = flow.helper_input.borrow().is_some();
-    let dialog = &flow.dialog;
-    let filled = !dialog.input.text().is_empty();
-    let failed = flow.failed.get() || dialog.notice.has_css_class("error-text");
-    for (class, on) in [("filled", filled && !failed), ("failed", failed)] {
-        if on {
-            dialog.field.add_css_class(class);
-        } else {
-            dialog.field.remove_css_class(class);
-        }
-    }
-    let prompt = flow.prompt.borrow();
-    let prompt = prompt.trim_end().trim_end_matches(':').trim_end();
-    let placeholder = if !waiting {
-        "Checking..."
-    } else if prompt.is_empty() {
-        "Password"
-    } else {
-        prompt
-    };
-    dialog.input.set_placeholder_text(Some(placeholder));
-    dialog.input.set_editable(waiting);
-}
-
-fn set_notice(flow: &Flow, text: &str, error: bool) {
-    let notice = &flow.dialog.notice;
-    notice.set_text(text);
-    notice.set_visible(!text.is_empty());
-    if error {
-        notice.add_css_class("error-text");
-    } else {
-        notice.remove_css_class("error-text");
-    }
-}
-
-fn start_helper(polkit: Weak<Polkit>, flow: Rc<Flow>) {
-    let generation = flow.generation.get() + 1;
-    flow.generation.set(generation);
-    glib::spawn_future_local(async move {
-        let streams = match connect_helper(&flow.username).await {
-            Ok(streams) => streams,
-            Err(e) => {
+    fn helper_event(&mut self, event: Helper, sender: &ComponentSender<Self>) {
+        let Some(flow) = &mut self.flow else { return };
+        let line = match event {
+            Helper::Started { keep, input } => {
+                flow.helper = Some(keep);
+                flow.helper_input = Some(input);
+                return;
+            }
+            Helper::Failed(e) => {
                 eprintln!("wakeshell: cannot start polkit-agent-helper-1: {e}");
-                if let Some(polkit) = polkit.upgrade() {
-                    polkit.cancel();
-                }
-                return;
+                return self.finish(false, sender);
             }
+            Helper::Line(line) => line,
         };
-        let (input, output, keep) = streams;
-        flow.helper.replace(Some(keep));
-        // The cookie goes on stdin so other processes cannot see it
-        let _ = output.write_all_future(format!("{}\n", flow.request.cookie), glib::Priority::DEFAULT).await;
-        let input = gio::DataInputStream::new(&input);
-        loop {
-            let line = input.read_line_utf8_future(glib::Priority::DEFAULT).await;
-            if flow.generation.get() != generation {
-                return;
+        if let Some(prompt) =
+            line.strip_prefix("PAM_PROMPT_ECHO_OFF ").or_else(|| line.strip_prefix("PAM_PROMPT_ECHO_ON "))
+        {
+            flow.echo = line.starts_with("PAM_PROMPT_ECHO_ON ");
+            flow.prompt = prompt.to_owned();
+            flow.waiting = true;
+            self.focus.set(true);
+        } else if let Some(message) = line.strip_prefix("PAM_ERROR_MSG ") {
+            self.set_notice(message, true);
+        } else if let Some(message) = line.strip_prefix("PAM_TEXT_INFO ") {
+            self.set_notice(message, false);
+        } else if line.starts_with("SUCCESS") {
+            self.finish(true, sender);
+        } else {
+            // Ask again
+            flow.helper = None;
+            flow.helper_input = None;
+            flow.waiting = false;
+            flow.failed = true;
+            if !self.notice_error || self.notice.is_empty() {
+                self.set_notice("Wrong password, try again", true);
             }
-            let Some(polkit) = polkit.upgrade() else { return };
-            let line = match line {
-                Ok(Some(line)) => unescape(&line),
-                _ => "FAILURE".to_owned(),
-            };
-            if let Some(prompt) =
-                line.strip_prefix("PAM_PROMPT_ECHO_OFF ").or_else(|| line.strip_prefix("PAM_PROMPT_ECHO_ON "))
-            {
-                flow.dialog.input.set_visibility(line.starts_with("PAM_PROMPT_ECHO_ON "));
-                flow.prompt.replace(prompt.to_owned());
-                flow.helper_input.replace(Some(output.clone()));
-                update(&flow);
-                flow.dialog.input.grab_focus();
-            } else if let Some(message) = line.strip_prefix("PAM_ERROR_MSG ") {
-                set_notice(&flow, message, true);
-                update(&flow);
-            } else if let Some(message) = line.strip_prefix("PAM_TEXT_INFO ") {
-                set_notice(&flow, message, false);
-            } else if line.starts_with("SUCCESS") {
-                polkit.finish(true);
-                return;
-            } else {
-                // Ask again
-                flow.helper.take();
-                flow.helper_input.take();
-                flow.failed.set(true);
-                if !flow.dialog.notice.has_css_class("error-text") || flow.dialog.notice.text().is_empty() {
-                    set_notice(&flow, "Wrong password, try again", true);
-                }
-                update(&flow);
-                start_helper(Rc::downgrade(&polkit), flow.clone());
-                return;
-            }
+            self.start_helper(sender);
         }
-    });
+    }
+
+    fn start_helper(&mut self, sender: &ComponentSender<Self>) {
+        let Some(flow) = &self.flow else { return };
+        let generation = self.generation.get() + 1;
+        self.generation.set(generation);
+        let latest = self.generation.clone();
+        let (username, cookie) = (flow.username.clone(), flow.request.cookie.clone());
+        let sender = sender.input_sender().clone();
+        glib::spawn_future_local(async move {
+            let send = |event| sender.send(PolkitMsg::Helper(generation, event)).is_ok();
+            let (input, output, keep) = match connect_helper(&username).await {
+                Ok(streams) => streams,
+                Err(e) => {
+                    send(Helper::Failed(e));
+                    return;
+                }
+            };
+            send(Helper::Started { keep, input: output.clone() });
+            // The cookie goes on stdin so other processes cannot see it
+            let _ = output.write_all_future(format!("{cookie}\n"), glib::Priority::DEFAULT).await;
+            let input = gio::DataInputStream::new(&input);
+            loop {
+                let line = input.read_line_utf8_future(glib::Priority::DEFAULT).await;
+                if latest.get() != generation {
+                    return;
+                }
+                let line = match line {
+                    Ok(Some(line)) => unescape(&line),
+                    _ => "FAILURE".to_owned(),
+                };
+                let done = !line.starts_with("PAM_");
+                if !send(Helper::Line(line)) || done {
+                    return;
+                }
+            }
+        });
+    }
 }
 
 async fn connect_helper(username: &str) -> Result<(gio::InputStream, gio::OutputStream, glib::Object), glib::Error> {

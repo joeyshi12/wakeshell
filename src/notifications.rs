@@ -1,17 +1,16 @@
 // Notification daemon (org.freedesktop.Notifications).
 use std::{
-    cell::{Cell, RefCell},
-    collections::HashMap,
-    rc::Rc,
+    collections::{HashMap, HashSet},
     sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
 
 use gtk::{gdk, gio, glib, prelude::*};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
+use relm4::{RelmWidgetExt, factory::FactoryVecDeque, prelude::*};
 use zbus::zvariant::OwnedValue;
 
-use crate::util;
+use crate::util::{self, Events};
 
 const PATH: &str = "/org/freedesktop/Notifications";
 const INTERFACE: &str = "org.freedesktop.Notifications";
@@ -27,6 +26,7 @@ const EXPIRED: u32 = 1;
 const DISMISSED: u32 = 2;
 const CLOSED: u32 = 3;
 
+#[derive(Debug)]
 struct ImageData {
     width: i32,
     height: i32,
@@ -35,7 +35,8 @@ struct ImageData {
     data: Vec<u8>,
 }
 
-struct Notification {
+#[derive(Debug)]
+pub struct Notification {
     id: u32,
     app_name: String,
     app_icon: String,
@@ -126,310 +127,356 @@ impl Server {
     }
 }
 
-struct Popup {
-    notification: Notification,
-    widget: gtk::Box,
-    timer: RefCell<Option<glib::SourceId>>,
-    hovered: Cell<bool>,
-}
-
 pub struct Notifications {
-    window: gtk::Window,
-    column: gtk::Box,
-    more: gtk::Label,
-    popups: RefCell<Vec<Rc<Popup>>>,
-    connection: RefCell<Option<zbus::Connection>>,
+    /// Newest first
+    popups: FactoryVecDeque<Popup>,
+    timers: HashMap<u32, glib::SourceId>,
+    hovered: HashSet<u32>,
+    hidden: usize,
+    connection: Option<zbus::Connection>,
 }
 
-impl Notifications {
-    pub fn new() -> Rc<Notifications> {
-        let window = util::layer_window(util::LayerOptions {
+#[derive(Debug)]
+pub enum NotificationsMsg {
+    Connected(zbus::Connection),
+    Notify(Notification),
+    Close(u32, u32),
+    Expired(u32),
+    Popup(PopupEvent),
+}
+
+#[derive(Debug)]
+pub enum PopupEvent {
+    Clicked(u32, u32),
+    Action(u32, String),
+    Hover(u32, bool),
+}
+
+#[relm4::component(pub)]
+impl Component for Notifications {
+    type Init = ();
+    type Input = NotificationsMsg;
+    type Output = ();
+    type CommandOutput = ();
+
+    view! {
+        util::layer_window(util::LayerOptions {
             namespace: "wakeshell-notifications",
             layer: Layer::Overlay,
             anchors: [true, false, false, true],
             keyboard: KeyboardMode::None,
             monitor: None,
             exclusive_zone: 0,
-        });
-        window.set_margin(Edge::Top, 12);
-        window.set_margin(Edge::Right, 12);
-        let column = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        column.set_size_request(WIDTH, -1);
-        column.set_margin_end(SHADOW);
-        column.set_margin_bottom(SHADOW);
-        let more = util::label("", &["notification-more", "small"]);
-        more.set_halign(gtk::Align::End);
-        window.set_child(Some(&column));
+        }) -> gtk::Window {
+            set_margin: (Edge::Top, 12),
+            set_margin: (Edge::Right, 12),
+            set_visible: false,
 
-        let notifications = Rc::new(Notifications {
-            window,
-            column,
-            more,
-            popups: RefCell::new(Vec::new()),
-            connection: RefCell::new(None),
-        });
+            gtk::Box {
+                set_orientation: gtk::Orientation::Vertical,
+                set_spacing: 10,
+                set_size_request: (WIDTH, -1),
+                set_margin_end: SHADOW,
+                set_margin_bottom: SHADOW,
 
-        let (sender, receiver) = async_channel::unbounded();
-        let server = Server { events: sender, next_id: AtomicU32::new(1) };
-        let weak = Rc::downgrade(&notifications);
+                #[local_ref]
+                popups -> gtk::Box {
+                    set_orientation: gtk::Orientation::Vertical,
+                    set_spacing: 10,
+                },
+                gtk::Label {
+                    set_css_classes: &["notification-more", "small"],
+                    set_halign: gtk::Align::End,
+                    #[watch]
+                    set_visible: model.hidden > 0,
+                    #[watch]
+                    set_label: &format!("{} more", model.hidden),
+                },
+            },
+        }
+    }
+
+    fn init(_: (), root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
+        let model = Notifications {
+            popups: FactoryVecDeque::builder()
+                .launch(gtk::Box::default())
+                .forward(sender.input_sender(), NotificationsMsg::Popup),
+            timers: HashMap::new(),
+            hovered: HashSet::new(),
+            hidden: 0,
+            connection: None,
+        };
+        let popups = model.popups.widget();
+        let widgets = view_output!();
+
+        let (events, receiver) = async_channel::unbounded();
+        let server = Server { events, next_id: AtomicU32::new(1) };
         glib::spawn_future_local(async move {
             let connection = async {
-                zbus::connection::Builder::session()?
-                    .name(INTERFACE)?
-                    .serve_at(PATH, server)?
-                    .build()
-                    .await
+                zbus::connection::Builder::session()?.name(INTERFACE)?.serve_at(PATH, server)?.build().await
             }
             .await;
             match connection {
-                Ok(connection) => {
-                    if let Some(n) = weak.upgrade() {
-                        n.connection.replace(Some(connection));
-                    }
-                }
+                Ok(connection) => sender.input(NotificationsMsg::Connected(connection)),
                 Err(e) => {
                     eprintln!("wakeshell: notifications are off, cannot own {INTERFACE}: {e}");
                     return;
                 }
             }
             while let Ok(event) = receiver.recv().await {
-                let Some(n) = weak.upgrade() else { return };
-                match event {
-                    Event::Notify(notification) => n.add(notification),
-                    Event::Close(id) => n.close(id, CLOSED),
-                }
+                sender.input(match event {
+                    Event::Notify(notification) => NotificationsMsg::Notify(notification),
+                    Event::Close(id) => NotificationsMsg::Close(id, CLOSED),
+                });
             }
         });
-        notifications
+        ComponentParts { model, widgets }
+    }
+
+    fn update(&mut self, msg: NotificationsMsg, sender: ComponentSender<Self>, root: &Self::Root) {
+        match msg {
+            NotificationsMsg::Connected(connection) => self.connection = Some(connection),
+            NotificationsMsg::Notify(notification) => {
+                let id = notification.id;
+                let position = self.popups.iter().position(|p| p.notification.id == id);
+                let mut popups = self.popups.guard();
+                match position {
+                    Some(i) => {
+                        if let Some(timer) = self.timers.remove(&id) {
+                            timer.remove();
+                        }
+                        self.hovered.remove(&id);
+                        popups.remove(i);
+                        popups.insert(i, notification);
+                    }
+                    None => {
+                        popups.push_front(notification);
+                    }
+                }
+                drop(popups);
+                self.refresh(&sender, root);
+            }
+            NotificationsMsg::Close(id, reason) => self.close(id, reason, &sender, root),
+            NotificationsMsg::Expired(id) => {
+                // The timer is gone once it fires
+                self.timers.remove(&id);
+                self.close(id, EXPIRED, &sender, root);
+            }
+            NotificationsMsg::Popup(PopupEvent::Clicked(id, button)) => match button {
+                3 => {
+                    let ids: Vec<u32> = self.popups.iter().map(|p| p.notification.id).collect();
+                    for id in ids {
+                        self.close(id, DISMISSED, &sender, root);
+                    }
+                }
+                1 if self.find(id).is_some_and(|n| n.actions.iter().any(|(key, _)| key == "default")) => {
+                    self.invoke(id, "default", &sender, root)
+                }
+                1 => self.close(id, DISMISSED, &sender, root),
+                _ => {}
+            },
+            NotificationsMsg::Popup(PopupEvent::Action(id, key)) => self.invoke(id, &key, &sender, root),
+            NotificationsMsg::Popup(PopupEvent::Hover(id, true)) => {
+                self.hovered.insert(id);
+                if let Some(timer) = self.timers.remove(&id) {
+                    timer.remove();
+                }
+            }
+            NotificationsMsg::Popup(PopupEvent::Hover(id, false)) => {
+                self.hovered.remove(&id);
+                if self.popups.iter().any(|p| p.notification.id == id && p.shown) {
+                    self.start_timer(id, &sender);
+                }
+            }
+        }
+    }
+}
+
+impl Notifications {
+    fn find(&self, id: u32) -> Option<&Notification> {
+        self.popups.iter().map(|p| &p.notification).find(|n| n.id == id)
     }
 
     fn emit(&self, member: &'static str, body: impl serde::Serialize + zbus::zvariant::DynamicType + 'static) {
-        let Some(connection) = self.connection.borrow().clone() else { return };
+        let Some(connection) = self.connection.clone() else { return };
         glib::spawn_future_local(async move {
             let _ = connection.emit_signal(None::<&str>, PATH, INTERFACE, member, &body).await;
         });
     }
 
-    fn add(self: &Rc<Self>, notification: Notification) {
-        let id = notification.id;
-        let popup = Rc::new(Popup {
-            widget: self.build_popup(&notification),
-            notification,
-            timer: RefCell::new(None),
-            hovered: Cell::new(false),
-        });
-        let mut popups = self.popups.borrow_mut();
-        match popups.iter().position(|p| p.notification.id == id) {
-            Some(i) => {
-                if let Some(timer) = popups[i].timer.take() {
+    fn close(&mut self, id: u32, reason: u32, sender: &ComponentSender<Self>, root: &gtk::Window) {
+        let Some(i) = self.popups.iter().position(|p| p.notification.id == id) else { return };
+        self.popups.guard().remove(i);
+        if let Some(timer) = self.timers.remove(&id) {
+            timer.remove();
+        }
+        self.hovered.remove(&id);
+        self.emit("NotificationClosed", (id, reason));
+        self.refresh(sender, root);
+    }
+
+    fn invoke(&mut self, id: u32, action: &str, sender: &ComponentSender<Self>, root: &gtk::Window) {
+        self.emit("ActionInvoked", (id, action.to_owned()));
+        if !self.find(id).is_some_and(|n| n.resident) {
+            self.close(id, DISMISSED, sender, root);
+        }
+    }
+
+    fn refresh(&mut self, sender: &ComponentSender<Self>, root: &gtk::Window) {
+        let mut shown = Vec::new();
+        for (i, popup) in self.popups.guard().iter_mut().enumerate() {
+            popup.shown = i < MAX_SHOWN;
+            shown.push((popup.notification.id, popup.shown));
+        }
+        for (id, shown) in shown {
+            if !shown {
+                if let Some(timer) = self.timers.remove(&id) {
                     timer.remove();
                 }
-                popups[i] = popup;
-            }
-            None => popups.push(popup),
-        }
-        drop(popups);
-        self.refresh();
-    }
-
-    fn close(self: &Rc<Self>, id: u32, reason: u32) {
-        let removed = {
-            let mut popups = self.popups.borrow_mut();
-            popups.iter().position(|p| p.notification.id == id).map(|i| popups.remove(i))
-        };
-        if let Some(popup) = removed {
-            if let Some(timer) = popup.timer.take() {
-                timer.remove();
-            }
-            self.emit("NotificationClosed", (id, reason));
-            self.refresh();
-        }
-    }
-
-    fn invoke(self: &Rc<Self>, id: u32, action: &str) {
-        self.emit("ActionInvoked", (id, action.to_owned()));
-        let resident = self.popups.borrow().iter().any(|p| p.notification.id == id && p.notification.resident);
-        if !resident {
-            self.close(id, DISMISSED);
-        }
-    }
-
-    fn refresh(self: &Rc<Self>) {
-        while let Some(child) = self.column.first_child() {
-            self.column.remove(&child);
-        }
-        let popups = self.popups.borrow();
-        for (i, popup) in popups.iter().rev().enumerate() {
-            if i < MAX_SHOWN {
-                self.column.append(&popup.widget);
-                if !popup.hovered.get() {
-                    self.start_timer(popup);
-                }
-            } else if let Some(timer) = popup.timer.take() {
-                timer.remove();
+            } else if !self.hovered.contains(&id) {
+                self.start_timer(id, sender);
             }
         }
-        let hidden = popups.len().saturating_sub(MAX_SHOWN);
-        if hidden > 0 {
-            self.more.set_text(&format!("{hidden} more"));
-            self.column.append(&self.more);
-        }
-        let any = !popups.is_empty();
-        drop(popups);
-        if any {
-            // Hiding and showing again makes the window shrink to fit what is left
-            self.window.set_visible(false);
-            self.window.present();
-        } else {
-            self.window.set_visible(false);
+        self.hidden = self.popups.len().saturating_sub(MAX_SHOWN);
+        // Hiding and showing again makes the window shrink to fit what is left
+        root.set_visible(false);
+        if !self.popups.is_empty() {
+            root.present();
         }
     }
 
-    fn start_timer(self: &Rc<Self>, popup: &Rc<Popup>) {
-        if popup.timer.borrow().is_some() {
+    fn start_timer(&mut self, id: u32, sender: &ComponentSender<Self>) {
+        let Some(n) = self.find(id) else { return };
+        if self.timers.contains_key(&id) || n.urgency == CRITICAL {
             return;
         }
-        let n = &popup.notification;
-        let timeout = if n.urgency == CRITICAL {
-            return;
-        } else if n.expire_timeout > 0 {
+        let timeout = if n.expire_timeout > 0 {
             n.expire_timeout as u64
         } else if n.urgency == LOW {
             5000
         } else {
             10000
         };
-        let weak = Rc::downgrade(self);
-        let id = n.id;
-        let weak_popup = Rc::downgrade(popup);
+        let sender = sender.clone();
         let source = glib::timeout_add_local_once(Duration::from_millis(timeout), move || {
-            if let Some(popup) = weak_popup.upgrade() {
-                popup.timer.take();
-            }
-            if let Some(n) = weak.upgrade() {
-                n.close(id, EXPIRED);
-            }
+            sender.input(NotificationsMsg::Expired(id))
         });
-        popup.timer.replace(Some(source));
+        self.timers.insert(id, source);
+    }
+}
+
+struct Popup {
+    notification: Notification,
+    shown: bool,
+}
+
+fn line(text: &str, classes: &[&str]) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.set_css_classes(classes);
+    label.set_visible(!text.is_empty());
+    label.set_xalign(0.0);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_max_width_chars(1);
+    label.set_hexpand(true);
+    label
+}
+
+#[relm4::factory]
+impl FactoryComponent for Popup {
+    type Init = Notification;
+    type Input = ();
+    type Output = PopupEvent;
+    type CommandOutput = ();
+    type ParentWidget = gtk::Box;
+
+    view! {
+        gtk::Box {
+            set_spacing: 12,
+            set_css_classes: &["card", "notification"],
+            set_class_active: ("low", self.notification.urgency == LOW),
+            set_class_active: ("critical", self.notification.urgency == CRITICAL),
+            set_cursor_from_name: Some("pointer"),
+            #[watch]
+            set_visible: self.shown,
+            on_click[sender, id = self.notification.id] => move |button| {
+                let _ = sender.output(PopupEvent::Clicked(id, button));
+            },
+            on_hover[sender, id = self.notification.id] => move |inside| {
+                let _ = sender.output(PopupEvent::Hover(id, inside));
+            },
+
+            #[name = "text"]
+            gtk::Box {
+                set_orientation: gtk::Orientation::Vertical,
+                set_spacing: 4,
+                set_hexpand: true,
+
+                line(&self.notification.app_name, &["app-name", "small", "bold"]),
+                line(&self.notification.summary, &["bold"]),
+                #[name = "body"]
+                gtk::Label {
+                    set_visible: !self.notification.body.is_empty(),
+                    set_wrap: true,
+                    set_wrap_mode: gtk::pango::WrapMode::WordChar,
+                    set_xalign: 0.0,
+                    set_max_width_chars: 1,
+                    set_hexpand: true,
+                    set_lines: 6,
+                    set_ellipsize: gtk::pango::EllipsizeMode::End,
+                },
+                #[name = "actions"]
+                gtk::FlowBox {
+                    set_selection_mode: gtk::SelectionMode::None,
+                    set_column_spacing: 8,
+                    set_row_spacing: 8,
+                    set_margin_top: 6,
+                    set_max_children_per_line: 8,
+                    set_visible: self.notification.actions.iter().any(|(key, _)| key != "default"),
+                },
+            },
+        }
     }
 
-    fn build_popup(self: &Rc<Self>, n: &Notification) -> gtk::Box {
-        let card = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        card.add_css_class("card");
-        card.add_css_class("notification");
-        match n.urgency {
-            LOW => card.add_css_class("low"),
-            CRITICAL => card.add_css_class("critical"),
-            _ => {}
-        }
-        util::hand_cursor(&card);
+    fn init_model(notification: Notification, _: &DynamicIndex, _: FactorySender<Self>) -> Self {
+        Popup { notification, shown: true }
+    }
 
+    fn init_widgets(
+        &mut self,
+        _index: &DynamicIndex,
+        root: Self::Root,
+        _returned_widget: &gtk::Widget,
+        sender: FactorySender<Self>,
+    ) -> Self::Widgets {
+        let widgets = view_output!();
+        let n = &self.notification;
         if let Some(image) = image(n) {
             image.set_pixel_size(24);
             image.set_valign(gtk::Align::Start);
             image.set_margin_top(2);
-            card.append(&image);
+            root.prepend(&image);
         }
-
-        let text = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        text.set_hexpand(true);
-        let line = |s: &str, classes: &[&str]| {
-            let label = util::label(s, classes);
-            label.set_xalign(0.0);
-            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            label.set_max_width_chars(1);
-            label.set_hexpand(true);
-            label
-        };
-        if !n.app_name.is_empty() {
-            text.append(&line(&n.app_name, &["app-name", "small", "bold"]));
+        match markup(&n.body) {
+            Some(markup) => widgets.body.set_markup(&markup),
+            None => widgets.body.set_text(&strip_tags(&n.body)),
         }
-        if !n.summary.is_empty() {
-            text.append(&line(&n.summary, &["bold"]));
+        for (key, label) in n.actions.iter().filter(|(key, _)| key != "default") {
+            let button = gtk::Label::new(Some(label));
+            button.set_css_classes(&["notification-button", "small"]);
+            button.set_cursor_from_name(Some("pointer"));
+            let click = gtk::GestureClick::new();
+            // Claim the click so the popup's own click does not also run
+            click.connect_pressed(|gesture, _, _, _| {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+            });
+            let (sender, id, key) = (sender.clone(), n.id, key.clone());
+            click.connect_released(move |_, _, _, _| {
+                let _ = sender.output(PopupEvent::Action(id, key.clone()));
+            });
+            button.add_controller(click);
+            widgets.actions.insert(&button, -1);
         }
-        if !n.body.is_empty() {
-            let body = util::wrapping_label("", &[]);
-            body.set_lines(6);
-            body.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            match markup(&n.body) {
-                Some(markup) => body.set_markup(&markup),
-                None => body.set_text(&strip_tags(&n.body)),
-            }
-            text.append(&body);
-        }
-        let buttons: Vec<_> = n.actions.iter().filter(|(key, _)| key != "default").cloned().collect();
-        if !buttons.is_empty() {
-            let row = gtk::FlowBox::new();
-            row.set_selection_mode(gtk::SelectionMode::None);
-            row.set_column_spacing(8);
-            row.set_row_spacing(8);
-            row.set_margin_top(6);
-            row.set_max_children_per_line(8);
-            for (key, label) in buttons {
-                let button = util::label(&label, &["notification-button", "small"]);
-                util::hand_cursor(&button);
-                let weak = Rc::downgrade(self);
-                let id = n.id;
-                let click = gtk::GestureClick::new();
-                // Claim the click so the popup's own click does not also run
-                click.connect_pressed(|gesture, _, _, _| {
-                    gesture.set_state(gtk::EventSequenceState::Claimed);
-                });
-                click.connect_released(move |_, _, _, _| {
-                    if let Some(n) = weak.upgrade() {
-                        n.invoke(id, &key);
-                    }
-                });
-                button.add_controller(click);
-                row.insert(&button, -1);
-            }
-            text.append(&row);
-        }
-        card.append(&text);
-
-        let id = n.id;
-        let has_default = n.actions.iter().any(|(key, _)| key == "default");
-        let weak = Rc::downgrade(self);
-        util::on_click(&card, move |button| {
-            let Some(n) = weak.upgrade() else { return };
-            match button {
-                3 => {
-                    let ids: Vec<u32> = n.popups.borrow().iter().map(|p| p.notification.id).collect();
-                    for id in ids {
-                        n.close(id, DISMISSED);
-                    }
-                }
-                1 if has_default => n.invoke(id, "default"),
-                1 => n.close(id, DISMISSED),
-                _ => {}
-            }
-        });
-
-        let hover = gtk::EventControllerMotion::new();
-        let weak = Rc::downgrade(self);
-        hover.connect_enter(move |_, _, _| {
-            let Some(n) = weak.upgrade() else { return };
-            if let Some(popup) = n.find(id) {
-                popup.hovered.set(true);
-                if let Some(timer) = popup.timer.take() {
-                    timer.remove();
-                }
-            }
-        });
-        let weak = Rc::downgrade(self);
-        hover.connect_leave(move |_| {
-            let Some(n) = weak.upgrade() else { return };
-            if let Some(popup) = n.find(id) {
-                popup.hovered.set(false);
-                n.start_timer(&popup);
-            }
-        });
-        card.add_controller(hover);
-        card
-    }
-
-    fn find(&self, id: u32) -> Option<Rc<Popup>> {
-        self.popups.borrow().iter().find(|p| p.notification.id == id).cloned()
+        widgets
     }
 }
 

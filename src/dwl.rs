@@ -31,7 +31,7 @@ mod protocol {
     wayland_scanner::generate_client_code!("protocols/dwl-ipc-unstable-v2.xml");
 }
 
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct OutputState {
     pub output: String,
     pub selected: bool,
@@ -45,12 +45,14 @@ pub struct OutputState {
     pub floating: bool,
 }
 
+#[derive(Debug)]
 pub enum Event {
     State(OutputState),
     /// dwl's togglebar binding
     ToggleVisibility(String),
 }
 
+#[derive(Debug)]
 pub enum Command {
     View(u32),
     ToggleView(u32),

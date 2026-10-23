@@ -17,11 +17,14 @@ mod style;
 mod util;
 mod wallpaper;
 
-use std::{io::Read, process::ExitCode, rc::Rc};
+use std::{collections::HashSet, io::Read, process::ExitCode, rc::Rc};
 
 use gtk::glib;
+use relm4::prelude::*;
 
 use config::Config;
+use launcher::LauncherMsg;
+use powermenu::PowerMenuMsg;
 
 const USAGE: &str = "usage: wakeshell [msg COMMAND... | volume up|down|mute | share-chooser]
 
@@ -34,93 +37,107 @@ Commands for msg:
   wallpaper reload               fade to the image the wallpaper link points at now";
 
 pub struct Shell {
-    launcher: Rc<launcher::Launcher>,
-    powermenu: Rc<powermenu::PowerMenu>,
-    osd: Rc<osd::Osd>,
-    wallpaper: Rc<wallpaper::Wallpaper>,
-    sharepicker: Rc<sharepicker::SharePicker>,
-    _bar: Rc<bar::Bar>,
-    _notifications: Rc<notifications::Notifications>,
-    _polkit: Rc<polkit::Polkit>,
+    launcher: Controller<launcher::Launcher>,
+    powermenu: Controller<powermenu::PowerMenu>,
+    osd: Controller<osd::Osd>,
+    wallpaper: Controller<wallpaper::Wallpaper>,
+    sharepicker: Controller<sharepicker::SharePicker>,
+    _bar: Controller<bar::Bar>,
+    _notifications: Controller<notifications::Notifications>,
+    _polkit: Controller<polkit::Polkit>,
+    overlays: HashSet<Overlay>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Overlay {
+    PowerMenu,
+    Polkit,
+    SharePicker,
+}
+
+#[derive(Debug)]
+pub enum ShellMsg {
+    Request(ipc::Request),
+    Overlay(Overlay, bool),
+}
+
+impl Component for Shell {
+    type Init = async_channel::Receiver<ipc::Request>;
+    type Input = ShellMsg;
+    type Output = ();
+    type CommandOutput = ();
+    type Root = ();
+    type Widgets = ();
+
+    fn init_root() {}
+
+    fn init(requests: Self::Init, _: (), sender: ComponentSender<Self>) -> ComponentParts<Self> {
+        let config = Rc::new(Config::load());
+        let overlay = |which| move |shown| ShellMsg::Overlay(which, shown);
+        let input = sender.input_sender();
+        let shell = Shell {
+            launcher: launcher::Launcher::builder().launch(config.clone()).detach(),
+            powermenu: powermenu::PowerMenu::builder()
+                .launch(config.clone())
+                .forward(input, move |powermenu::Shown(shown)| overlay(Overlay::PowerMenu)(shown)),
+            osd: osd::Osd::builder().launch(()).detach(),
+            wallpaper: wallpaper::Wallpaper::builder().launch(config.clone()).detach(),
+            sharepicker: sharepicker::SharePicker::builder()
+                .launch(())
+                .forward(input, move |sharepicker::Shown(shown)| overlay(Overlay::SharePicker)(shown)),
+            _bar: bar::Bar::builder().launch(config).detach(),
+            _notifications: notifications::Notifications::builder().launch(()).detach(),
+            _polkit: polkit::Polkit::builder()
+                .launch(())
+                .forward(input, move |polkit::Shown(shown)| overlay(Overlay::Polkit)(shown)),
+            overlays: HashSet::new(),
+        };
+        glib::spawn_future_local(async move {
+            while let Ok(request) = requests.recv().await {
+                sender.input(ShellMsg::Request(request));
+            }
+        });
+        ComponentParts { model: shell, widgets: () }
+    }
+
+    fn update(&mut self, msg: ShellMsg, _: ComponentSender<Self>, _: &()) {
+        match msg {
+            // Overlays never stack
+            ShellMsg::Overlay(which, true) => {
+                self.overlays.insert(which);
+                self.launcher.emit(LauncherMsg::Close);
+            }
+            ShellMsg::Overlay(which, false) => {
+                self.overlays.remove(&which);
+            }
+            ShellMsg::Request(request) => self.handle(request),
+        }
+    }
 }
 
 impl Shell {
-    fn new() -> Rc<Shell> {
-        let config = Rc::new(Config::load());
-        Rc::new_cyclic(|shell: &std::rc::Weak<Shell>| {
-            // Overlays never stack
-            let close_launcher: Rc<dyn Fn()> = {
-                let shell = shell.clone();
-                Rc::new(move || {
-                    if let Some(shell) = shell.upgrade() {
-                        shell.launcher.close();
-                    }
-                })
-            };
-            let blocked: Rc<dyn Fn() -> bool> = {
-                let shell = shell.clone();
-                Rc::new(move || {
-                    shell.upgrade().is_some_and(|shell| {
-                        shell.powermenu.shown() || shell._polkit.active() || shell.sharepicker.shown()
-                    })
-                })
-            };
-            Shell {
-                launcher: launcher::Launcher::new(config.clone(), blocked),
-                powermenu: powermenu::PowerMenu::new(config.clone(), close_launcher.clone()),
-                osd: osd::Osd::new(),
-                wallpaper: wallpaper::Wallpaper::new(config.clone()),
-                sharepicker: sharepicker::SharePicker::new(close_launcher.clone()),
-                _bar: bar::Bar::new(config.clone()),
-                _notifications: notifications::Notifications::new(),
-                _polkit: polkit::Polkit::new(close_launcher),
-            }
-        })
-    }
-
     fn handle(&self, request: ipc::Request) {
         let args: Vec<&str> = request.args.iter().map(String::as_str).collect();
-        let ok = || "ok".to_owned();
-        let reply = match args.as_slice() {
-            ["launcher", "toggle"] => {
-                self.launcher.toggle();
-                ok()
-            }
-            ["launcher", "open"] => {
-                self.launcher.open();
-                ok()
-            }
-            ["launcher", "close"] => {
-                self.launcher.close();
-                ok()
-            }
-            ["powermenu", "toggle"] => {
-                self.powermenu.toggle();
-                ok()
-            }
-            ["powermenu", "open"] => {
-                self.powermenu.open();
-                ok()
-            }
-            ["powermenu", "close"] => {
-                self.powermenu.close();
-                ok()
-            }
-            ["osd", "volume"] => {
-                self.osd.volume();
-                ok()
-            }
-            ["wallpaper", "reload"] => {
-                self.wallpaper.reload();
-                ok()
-            }
+        let blocked = !self.overlays.is_empty();
+        match args.as_slice() {
+            ["launcher", "toggle"] => self.launcher.emit(LauncherMsg::Toggle { blocked }),
+            ["launcher", "open"] => self.launcher.emit(LauncherMsg::Open { blocked }),
+            ["launcher", "close"] => self.launcher.emit(LauncherMsg::Close),
+            ["powermenu", "toggle"] => self.powermenu.emit(PowerMenuMsg::Toggle),
+            ["powermenu", "open"] => self.powermenu.emit(PowerMenuMsg::Open),
+            ["powermenu", "close"] => self.powermenu.emit(PowerMenuMsg::Close),
+            ["osd", "volume"] => self.osd.emit(osd::OsdMsg::Volume),
+            ["wallpaper", "reload"] => self.wallpaper.emit(wallpaper::WallpaperMsg::Reload),
             ["sharepicker", sources] => {
-                self.sharepicker.pick(sources, request.reply);
-                return;
+                let sources = sources.to_string();
+                return self.sharepicker.emit(sharepicker::SharePickerMsg::Pick(sources, request.reply));
             }
-            _ => format!("error: unknown command {:?}. {USAGE}", request.args.join(" ")),
-        };
-        request.reply.send(reply);
+            _ => {
+                let error = format!("error: unknown command {:?}. {USAGE}", request.args.join(" "));
+                return request.reply.send(error);
+            }
+        }
+        request.reply.send("ok");
     }
 }
 
@@ -141,12 +158,7 @@ fn run() -> ExitCode {
         }
     };
     style::load();
-    let shell = Shell::new();
-    glib::spawn_future_local(async move {
-        while let Ok(request) = requests.recv().await {
-            shell.handle(request);
-        }
-    });
+    let _shell = Shell::builder().launch(requests).detach();
 
     let main_loop = glib::MainLoop::new(None, false);
     for signal in [libc::SIGTERM, libc::SIGINT] {

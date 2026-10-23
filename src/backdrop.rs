@@ -6,45 +6,45 @@ use gtk::{gdk, gio, glib, prelude::*};
 
 use crate::{ppm, util};
 
-pub fn wrap(window: &gtk::Window, content: &impl IsA<gtk::Widget>, on_ready: impl Fn() + 'static) -> gtk::Widget {
+pub fn new() -> gtk::Overlay {
     let overlay = gtk::Overlay::new();
     let picture = gtk::Picture::new();
     picture.set_content_fit(gtk::ContentFit::Cover);
     picture.set_can_shrink(true);
     picture.add_css_class("backdrop-image");
     overlay.set_child(Some(&picture));
-
     let dim = gtk::Box::new(gtk::Orientation::Vertical, 0);
     dim.add_css_class("backdrop-dim");
-    dim.set_opacity(0.0);
     overlay.add_overlay(&dim);
-    overlay.add_overlay(content);
 
-    let ready: Rc<dyn Fn()> = {
-        let done = Cell::new(false);
-        Rc::new(move || {
-            if !done.replace(true) {
-                dim.set_opacity(1.0);
-                on_ready();
+    // Bumped per map, so a late capture or timeout from an earlier one does nothing
+    let generation = Rc::new(Cell::new(0u32));
+    overlay.connect_map(move |overlay| {
+        let current = generation.get() + 1;
+        generation.set(current);
+        overlay.set_opacity(0.0);
+        picture.set_paintable(None::<&gdk::Paintable>);
+
+        let (timeout, shown, latest) = (overlay.clone(), overlay.clone(), generation.clone());
+        glib::timeout_add_local_once(Duration::from_millis(400), move || {
+            if latest.get() == current {
+                timeout.set_opacity(1.0);
             }
-        })
-    };
-
-    let timeout = ready.clone();
-    glib::timeout_add_local_once(Duration::from_millis(400), move || timeout());
-
-    window.connect_map(move |window| {
-        let window = window.clone();
-        let picture = picture.clone();
-        let ready = ready.clone();
+        });
+        let (picture, latest) = (picture.clone(), generation.clone());
+        let Some(window) = overlay.root().and_downcast::<gtk::Window>() else { return };
         glib::spawn_future_local(async move {
-            if let Some(texture) = capture(&window).await {
+            let texture = capture(&window).await;
+            if latest.get() != current {
+                return;
+            }
+            if let Some(texture) = texture {
                 picture.set_paintable(Some(&texture));
             }
-            ready();
+            shown.set_opacity(1.0);
         });
     });
-    overlay.upcast()
+    overlay
 }
 
 // grim -s takes ~250ms at 2560x1440, a full-size PPM ~25ms, so shrink and blur here. GTK's CSS

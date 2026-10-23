@@ -1,18 +1,7 @@
 # wakeshell
 
 The desktop shell for my [dwl](https://github.com/joeyshi12/dwl) session, written in Rust with
-GTK 4 and gtk4-layer-shell. One process provides:
-
-- the wallpaper on every monitor, with a fade when it changes
-- the bar: dwl's tags, layout symbol and window title (over dwl's ipc protocol), plus CPU load,
-  memory, Wi-Fi and the clock on the selected monitor
-- the app launcher
-- notifications (`org.freedesktop.Notifications`)
-- the volume popup
-- the power menu and the polkit password dialog, over a blurred copy of the screen
-- the screen-share picker for xdg-desktop-portal-wlr
-
-The lock screen is a separate program, [wakelock](https://github.com/joeyshi12/wakelock).
+GTK 4 (through Relm4) and gtk4-layer-shell.
 
 ## Installing
 

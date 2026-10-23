@@ -45,60 +45,88 @@ pub fn overlay_window(namespace: &str) -> gtk::Window {
     })
 }
 
-pub fn hand_cursor(widget: &impl IsA<gtk::Widget>) {
-    widget.set_cursor_from_name(Some("pointer"));
-}
-
-pub fn on_click(widget: &impl IsA<gtk::Widget>, f: impl Fn(u32) + 'static) {
-    let click = gtk::GestureClick::new();
-    click.set_button(0);
-    click.connect_released(move |gesture, _, x, y| {
-        let widget = gesture.widget().unwrap();
-        if widget.contains(x, y) {
-            f(gesture.current_button());
-        }
-    });
-    widget.add_controller(click);
-}
-
-/// Calls `f` on a click in `root` outside `inside`
-pub fn on_click_outside(
-    root: &impl IsA<gtk::Widget>,
-    inside: &[gtk::Widget],
-    f: impl Fn() + 'static,
-) {
-    let inside = inside.to_vec();
-    let click = gtk::GestureClick::new();
-    click.connect_released(move |gesture, _, x, y| {
-        let root = gesture.widget().unwrap();
-        let within = root.pick(x, y, gtk::PickFlags::DEFAULT).is_some_and(|picked| {
-            inside.iter().any(|w| &picked == w || picked.is_ancestor(w))
+/// Event controllers as methods, so `view!` can attach them like signal handlers
+pub trait Events: IsA<gtk::Widget> {
+    fn on_click(&self, f: impl Fn(u32) + 'static) {
+        let click = gtk::GestureClick::new();
+        click.set_button(0);
+        click.connect_released(move |gesture, _, x, y| {
+            let widget = gesture.widget().unwrap();
+            if widget.contains(x, y) {
+                f(gesture.current_button());
+            }
         });
-        if !within {
-            f();
-        }
-    });
-    root.add_controller(click);
+        self.add_controller(click);
+    }
+
+    fn on_left_click(&self, f: impl Fn() + 'static) {
+        self.on_click(move |button| {
+            if button == 1 {
+                f()
+            }
+        });
+    }
+
+    /// A click in the widget outside `inside`
+    fn on_click_outside(&self, inside: &[gtk::Widget], f: impl Fn() + 'static) {
+        let inside = inside.to_vec();
+        let click = gtk::GestureClick::new();
+        click.connect_released(move |gesture, _, x, y| {
+            let root = gesture.widget().unwrap();
+            let within = root.pick(x, y, gtk::PickFlags::DEFAULT).is_some_and(|picked| {
+                inside.iter().any(|w| &picked == w || picked.is_ancestor(w))
+            });
+            if !within {
+                f();
+            }
+        });
+        self.add_controller(click);
+    }
+
+    /// Skips the first event after entering, so a resting pointer does not pick anything
+    fn on_pointer_moved(&self, f: impl Fn(f64, f64) + 'static) {
+        let motion = gtk::EventControllerMotion::new();
+        let last: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
+        let enter_last = last.clone();
+        motion.connect_enter(move |_, x, y| {
+            if enter_last.get().is_none() {
+                enter_last.set(Some((x, y)));
+            }
+        });
+        motion.connect_motion(move |_, x, y| {
+            let previous = last.replace(Some((x, y)));
+            if previous.is_some_and(|p| p != (x, y)) {
+                f(x, y);
+            }
+        });
+        self.add_controller(motion);
+    }
+
+    fn on_hover(&self, f: impl Fn(bool) + 'static) {
+        let motion = gtk::EventControllerMotion::new();
+        let f = Rc::new(f);
+        let enter = f.clone();
+        motion.connect_enter(move |_, _, _| enter(true));
+        motion.connect_leave(move |_| f(false));
+        self.add_controller(motion);
+    }
+
+    /// Capture phase, so it sees Tab and Return before text fields do
+    fn on_key(&self, f: impl Fn(gdk::Key, gdk::ModifierType) -> bool + 'static) {
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        keys.connect_key_pressed(move |_, key, _, modifiers| {
+            if f(key, modifiers) {
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        self.add_controller(keys);
+    }
 }
 
-/// Skips the first event after entering, so a resting pointer does not pick a row
-pub fn on_pointer_moved(widget: &impl IsA<gtk::Widget>, f: impl Fn(f64, f64) + 'static) {
-    let motion = gtk::EventControllerMotion::new();
-    let last: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
-    let enter_last = last.clone();
-    motion.connect_enter(move |_, x, y| {
-        if enter_last.get().is_none() {
-            enter_last.set(Some((x, y)));
-        }
-    });
-    motion.connect_motion(move |_, x, y| {
-        let previous = last.replace(Some((x, y)));
-        if previous.is_some_and(|p| p != (x, y)) {
-            f(x, y);
-        }
-    });
-    widget.add_controller(motion);
-}
+impl<W: IsA<gtk::Widget>> Events for W {}
 
 pub fn spawn(argv: &[String]) {
     if argv.is_empty() {
@@ -151,59 +179,4 @@ pub async fn output_bytes(argv: &[&str]) -> Option<Vec<u8>> {
 pub fn window_monitor(window: &gtk::Window) -> Option<gdk::Monitor> {
     let surface = window.surface()?;
     WidgetExt::display(window).monitor_at_surface(&surface)
-}
-
-pub fn label(text: &str, classes: &[&str]) -> gtk::Label {
-    let label = gtk::Label::new(Some(text));
-    for class in classes {
-        label.add_css_class(class);
-    }
-    label
-}
-
-pub fn wrapping_label(text: &str, classes: &[&str]) -> gtk::Label {
-    let label = label(text, classes);
-    label.set_wrap(true);
-    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    label.set_xalign(0.0);
-    label.set_max_width_chars(1);
-    label.set_hexpand(true);
-    label
-}
-
-pub fn dialog_button(text: &str, primary: bool, f: impl Fn() + 'static) -> gtk::Widget {
-    let button = label(text, &["dialog-button"]);
-    if primary {
-        button.add_css_class("primary");
-    }
-    hand_cursor(&button);
-    on_click(&button, move |b| {
-        if b == 1 {
-            f()
-        }
-    });
-    button.upcast()
-}
-
-pub fn separator() -> gtk::Widget {
-    let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    line.add_css_class("separator-line");
-    line.upcast()
-}
-
-/// Capture phase, so it sees Tab and Return before text fields do
-pub fn on_key(
-    widget: &impl IsA<gtk::Widget>,
-    f: impl Fn(gdk::Key, gdk::ModifierType) -> bool + 'static,
-) {
-    let keys = gtk::EventControllerKey::new();
-    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
-    keys.connect_key_pressed(move |_, key, _, modifiers| {
-        if f(key, modifiers) {
-            glib::Propagation::Stop
-        } else {
-            glib::Propagation::Proceed
-        }
-    });
-    widget.add_controller(keys);
 }

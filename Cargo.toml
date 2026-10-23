@@ -12,6 +12,7 @@ glib-unix = "=0.22.8"
 gtk = { package = "gtk4", version = "=0.11.5", features = ["v4_16"] }
 gtk4-layer-shell = "=0.8.1"
 libc = "=0.2.191"
+relm4 = { version = "=0.11.0", default-features = false, features = ["macros"] }
 resvg = { version = "=0.48.1", default-features = false }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
