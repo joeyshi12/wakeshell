@@ -42,6 +42,9 @@ struct Pending {
     reply: Reply,
     sources: Vec<Source>,
     captures_left: usize,
+    /// Requests that came while this one was open, with their own lines. Chromium apps send
+    /// several at once, and they all get the one answer.
+    joined: Vec<(String, Reply)>,
 }
 
 pub struct SharePicker {
@@ -253,7 +256,10 @@ impl SimpleComponent for SharePicker {
 
 impl SharePicker {
     fn pick(&mut self, text: &str, reply: Reply, sender: &ComponentSender<Self>) {
-        self.finish("");
+        if let Some(pending) = &mut self.pending {
+            pending.joined.push((text.to_owned(), reply));
+            return;
+        }
         self.generation += 1;
         let generation = self.generation;
         let sources = parse(text, generation);
@@ -276,7 +282,7 @@ impl SharePicker {
             });
         }
         let captures_left = sources.len();
-        self.pending = Some(Pending { reply, sources, captures_left });
+        self.pending = Some(Pending { reply, sources, captures_left, joined: Vec::new() });
         let sender = sender.clone();
         glib::timeout_add_local_once(Duration::from_secs(3), move || sender.input(SharePickerMsg::Show(generation)));
     }
@@ -307,8 +313,24 @@ impl SharePicker {
                 let _ = std::fs::remove_file(&source.preview);
             }
             pending.reply.send(line);
+            for (text, reply) in pending.joined {
+                // Its own line for the same output or window, in case a title changed meanwhile
+                let key = source_key(line);
+                let own = text.lines().find(|l| *l == line).or_else(|| text.lines().find(|l| key.is_some() && source_key(l) == key));
+                reply.send(own.unwrap_or(""));
+            }
         }
     }
+}
+
+/// The output name or window identifier a portal line names
+fn source_key(line: &str) -> Option<&str> {
+    if let Some(rest) = line.strip_prefix("Monitor: ") {
+        return rest.split(' ').next().filter(|n| !n.is_empty());
+    }
+    let rest = line.strip_prefix("Window: ")?.strip_suffix(')')?;
+    let id = &rest[rest.rfind(" (")? + 2..];
+    (!id.is_empty() && !id.contains(['(', ')'])).then_some(id)
 }
 
 struct Tile {

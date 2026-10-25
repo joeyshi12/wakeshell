@@ -14,10 +14,11 @@ use crate::{
     dwl::{Command, Dwl, Event, OutputState},
     icon::Icon,
     monitors,
+    pipewire::{self, Audio},
     util::{self, Events},
 };
 
-const HEIGHT: i32 = 27;
+pub const HEIGHT: i32 = 27;
 
 pub struct Bar {
     config: Rc<Config>,
@@ -26,6 +27,7 @@ pub struct Bar {
     outputs: HashMap<String, OutputState>,
     hidden: HashSet<String>,
     status: Status,
+    sound: Sound,
 }
 
 #[derive(Debug)]
@@ -34,12 +36,34 @@ pub enum BarMsg {
     Dwl(Event),
     Tick,
     Click(String, Click),
+    Audio(Audio),
+    /// From `wakeshell msg`: open a popup under its bar item on the selected monitor
+    Open(Popup),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Popup {
+    Mixer,
+}
+
+/// What the shell does for the bar
+#[derive(Debug)]
+pub enum BarEvent {
+    /// `right`: from the item's right edge to the monitor's
+    Popup { which: Popup, output: String, right: i32 },
+    Volume(&'static str),
+}
+
+/// The bar's view of the audio: the default sink's volume and mute
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Sound {
+    volume: Option<(f64, bool)>,
 }
 
 impl Component for Bar {
     type Init = Rc<Config>;
     type Input = BarMsg;
-    type Output = ();
+    type Output = BarEvent;
     type CommandOutput = ();
     type Root = ();
     type Widgets = ();
@@ -54,6 +78,7 @@ impl Component for Bar {
             outputs: HashMap::new(),
             hidden: HashSet::new(),
             status: Status::read(),
+            sound: Sound::default(),
         };
         model.build(&sender);
         let monitors = sender.clone();
@@ -98,7 +123,33 @@ impl Component for Bar {
                     screen.emit(self.screen_state(&output));
                 }
             }
+            BarMsg::Audio(audio) => {
+                let sound = Sound { volume: audio.sink().map(|s| (s.volume, s.muted)) };
+                if sound != self.sound {
+                    self.sound = sound;
+                    for (_, screen) in &self.screens {
+                        screen.emit(ScreenMsg::Sound(self.sound.clone()));
+                    }
+                }
+            }
+            BarMsg::Open(which) => {
+                let selected = self.outputs.values().find(|s| s.selected).map(|s| s.output.clone());
+                let screen = self.screens.iter().find(|(o, _)| Some(o) == selected.as_ref()).or(self.screens.first());
+                if let Some((_, screen)) = screen {
+                    screen.emit(ScreenMsg::Open(which));
+                }
+            }
             BarMsg::Click(output, click) => {
+                let event = match click {
+                    Click::Popup(which, right) => Some(BarEvent::Popup { which, output: output.clone(), right }),
+                    Click::Volume(2) => Some(BarEvent::Volume("mute")),
+                    Click::Scroll(dy) => Some(BarEvent::Volume(if dy < 0.0 { "up" } else { "down" })),
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    let _ = sender.output(event);
+                    return;
+                }
                 let command = match click {
                     Click::Tag(i, 1) => Command::View(1 << i),
                     Click::Tag(i, 3) => Command::ToggleView(1 << i),
@@ -129,7 +180,12 @@ impl Bar {
             };
             let name = output.clone();
             let screen = Screen::builder()
-                .launch(ScreenInit { monitor, tags: self.config.tags.clone(), status: self.status.clone() })
+                .launch(ScreenInit {
+                    monitor,
+                    tags: self.config.tags.clone(),
+                    status: self.status.clone(),
+                    sound: self.sound.clone(),
+                })
                 .forward(sender.input_sender(), move |click| BarMsg::Click(name.clone(), click));
             screen.emit(self.screen_state(&output));
             self.screens.push((output, screen));
@@ -171,6 +227,9 @@ pub enum Click {
     Layout(u32),
     Title(u32),
     Status(u32),
+    Volume(u32),
+    Scroll(f64),
+    Popup(Popup, i32),
 }
 
 struct Screen {
@@ -179,24 +238,48 @@ struct Screen {
     title_changed: bool,
     hidden: bool,
     status: Status,
+    sound: Sound,
     tags: FactoryVecDeque<Tag>,
+    volume: Option<gtk::Widget>,
 }
 
 struct ScreenInit {
     monitor: gdk::Monitor,
     tags: Vec<String>,
     status: Status,
+    sound: Sound,
 }
 
 #[derive(Debug)]
 enum ScreenMsg {
     State { state: Option<OutputState>, hidden: bool },
     Status(Status),
+    Sound(Sound),
+    Open(Popup),
+    Click(Click),
 }
 
 impl Screen {
     fn has_window(&self) -> bool {
         self.state.as_ref().is_some_and(|s| s.has_window)
+    }
+
+    fn volume_icon(&self) -> &'static str {
+        self.sound.volume.map_or("volume-x", |(v, muted)| pipewire::volume_icon(v, muted))
+    }
+
+    fn volume_text(&self) -> String {
+        match self.sound.volume {
+            Some((_, true)) => "Muted".into(),
+            Some((v, false)) => format!("{}%", (v * 100.0).round()),
+            None => "?".into(),
+        }
+    }
+
+    /// From the item's right edge to the bar's
+    fn right_of(&self, item: &gtk::Widget) -> i32 {
+        item.compute_bounds(&self.window)
+            .map_or(0, |b| self.window.width() - (b.x() + b.width()).round() as i32)
     }
 }
 
@@ -291,6 +374,29 @@ impl SimpleComponent for Screen {
                         let _ = sender.output(Click::Status(button));
                     },
 
+                    #[name = "volume"]
+                    gtk::Box {
+                        set_spacing: 7,
+                        add_css_class: "bar-item",
+                        set_cursor_from_name: Some("pointer"),
+                        #[watch]
+                        set_class_active: ("muted-volume", !matches!(model.sound.volume, Some((_, false)))),
+                        on_own_click[sender] => move |button| match button {
+                            1 => sender.input(ScreenMsg::Open(Popup::Mixer)),
+                            _ => sender.input(ScreenMsg::Click(Click::Volume(button))),
+                        },
+                        on_scroll[sender] => move |dy| sender.input(ScreenMsg::Click(Click::Scroll(dy))),
+
+                        Icon::new("volume-2", 17) {
+                            set_valign: gtk::Align::Center,
+                            #[watch]
+                            set_icon: model.volume_icon(),
+                        },
+                        gtk::Label {
+                            #[watch]
+                            set_label: &model.volume_text(),
+                        },
+                    },
                     gtk::Box {
                         set_spacing: 7,
                         Icon::new("cpu", 17) {
@@ -337,10 +443,21 @@ impl SimpleComponent for Screen {
         for (i, name) in init.tags.into_iter().enumerate() {
             tags.guard().push_back((i, name));
         }
-        let model = Screen { window: root.clone(), state: None, title_changed: false, hidden: false, status: init.status, tags };
+        let mut model = Screen {
+            window: root.clone(),
+            state: None,
+            title_changed: false,
+            hidden: false,
+            status: init.status,
+            sound: Sound::default(),
+            tags,
+            volume: None,
+        };
         let tags = model.tags.widget();
         root.set_monitor(Some(&init.monitor));
         let widgets = view_output!();
+        model.volume = Some(widgets.volume.clone().upcast());
+        sender.input(ScreenMsg::Sound(init.sound));
         ComponentParts { model, widgets }
     }
 
@@ -355,8 +472,21 @@ impl SimpleComponent for Screen {
         self.window.destroy();
     }
 
-    fn update(&mut self, msg: ScreenMsg, _sender: ComponentSender<Self>) {
+    fn update(&mut self, msg: ScreenMsg, sender: ComponentSender<Self>) {
         match msg {
+            ScreenMsg::Sound(sound) => {
+                self.title_changed = false;
+                self.sound = sound;
+            }
+            ScreenMsg::Click(click) => {
+                self.title_changed = false;
+                let _ = sender.output(click);
+            }
+            ScreenMsg::Open(which) => {
+                self.title_changed = false;
+                let Some(volume) = &self.volume else { return };
+                let _ = sender.output(Click::Popup(which, self.right_of(volume)));
+            }
             ScreenMsg::State { state, hidden } => {
                 self.hidden = hidden;
                 let mut tags = self.tags.guard();

@@ -1,11 +1,11 @@
-/* Colours come from colors.css (or the defaults in style.rs). Cards are cel-shaded: a thick
- * outline and a hard shadow. */
+/* Colours are the --wakenight-* variables from ~/.config/gtk-4.0/gtk.css (fallbacks in style.rs).
+ * Cards are cel-shaded: a thick outline and a hard shadow. */
 
 window.wakeshell {
     background: transparent;
     font-family: "JetBrains Mono";
     font-size: 15px;
-    color: @fg;
+    color: var(--wakenight-fg);
 }
 
 window.wakeshell * {
@@ -15,89 +15,89 @@ window.wakeshell * {
 .small { font-size: 13px; }
 .large { font-size: 17px; }
 .bold { font-weight: bold; }
-.dim { color: @fg_dim; }
-.muted { color: @fg_muted; }
+.dim { color: var(--wakenight-fg-dim); }
+.muted { color: var(--wakenight-fg-muted); }
 
 .card {
-    background: @bg;
-    border: 3px solid @accent;
+    background: var(--wakenight-bg);
+    border: 3px solid var(--wakenight-accent);
     border-radius: 12px;
-    box-shadow: 5px 5px 0 0 alpha(@shadow, 0.85);
+    box-shadow: 5px 5px 0 0 rgb(from var(--wakenight-shadow) r g b / 0.85);
 }
 
 .card-header {
-    background: @bg_alt;
+    background: var(--wakenight-bg-alt);
     border-radius: 9px 9px 0 0;
     min-height: 52px;
     padding: 0 20px;
 }
 
 .separator-line {
-    background: @bg_alt;
+    background: var(--wakenight-bg-alt);
     min-height: 1px;
 }
 
 text {
     all: unset;
-    caret-color: @fg;
-    color: @fg;
+    caret-color: var(--wakenight-fg);
+    color: var(--wakenight-fg);
 }
 text selection {
-    background: @accent;
-    color: @bg;
+    background: var(--wakenight-accent);
+    color: var(--wakenight-bg);
 }
 text placeholder {
-    color: @fg_muted;
+    color: var(--wakenight-fg-muted);
 }
 
 .field {
-    background: @bg_alt;
-    border: 3px solid @bg_alt;
+    background: var(--wakenight-bg-alt);
+    border: 3px solid var(--wakenight-bg-alt);
     border-radius: 8px;
     min-height: 38px;
     padding: 0 16px;
 }
-.field.filled { border-color: @accent; }
-.field.failed { border-color: @urgent; }
+.field.filled { border-color: var(--wakenight-accent); }
+.field.failed { border-color: var(--wakenight-urgent); }
 
 .dialog-button {
-    background: @bg_alt;
-    border: 1px solid @bg_alt;
+    background: var(--wakenight-bg-alt);
+    border: 1px solid var(--wakenight-bg-alt);
     border-radius: 6px;
     padding: 7px 16px;
-    color: @fg;
+    color: var(--wakenight-fg);
 }
-.dialog-button:hover { border-color: @accent; }
+.dialog-button:hover { border-color: var(--wakenight-accent); }
 .dialog-button.primary {
-    background: @accent;
-    border-color: @accent;
-    color: @bg;
+    background: var(--wakenight-accent);
+    border-color: var(--wakenight-accent);
+    color: var(--wakenight-bg);
     font-weight: bold;
 }
-.dialog-button.primary:hover { border-color: @fg; }
+.dialog-button.primary:hover { border-color: var(--wakenight-fg); }
 
-.error-text { color: @urgent; }
+.error-text { color: var(--wakenight-urgent); }
 
 /* Wallpaper */
-window.wallpaper { background: @bg; }
+window.wallpaper { background: var(--wakenight-bg); }
 
 /* Bar */
 window.bar {
-    background: @bg;
+    background: var(--wakenight-bg);
     font-weight: bold;
 }
 .tag {
     min-width: 35px;
-    color: @fg_dim;
-    background: @bg;
+    color: var(--wakenight-fg-dim);
+    background: var(--wakenight-bg);
 }
 .tag.occupied, .tag.viewed {
-    color: @fg;
-    background: @bg_alt;
+    color: var(--wakenight-fg);
+    background: var(--wakenight-bg-alt);
 }
 .tag.urgent {
-    color: @urgent;
-    background: @bg_alt;
+    color: var(--wakenight-urgent);
+    background: var(--wakenight-bg-alt);
 }
 .tag .underline {
     background: currentColor;
@@ -105,11 +105,11 @@ window.bar {
     margin: 0 4px;
 }
 .layout-symbol {
-    color: @fg_dim;
+    color: var(--wakenight-fg-dim);
     padding: 0 10px;
 }
 .title { margin: 0 12px 0 4px; }
-.title.unselected { color: @fg_dim; }
+.title.unselected { color: var(--wakenight-fg-dim); }
 .floating-box {
     border: 1px solid currentColor;
     min-width: 3px;
@@ -117,92 +117,159 @@ window.bar {
     margin: 3px 3px 0 0;
 }
 .status { margin-right: 10px; }
-.status .off { color: @fg_dim; }
+.status .off { color: var(--wakenight-fg-dim); }
 
 /* Launcher */
 .launcher-search {
     min-height: 52px;
     padding: 0 20px;
 }
-.launcher-prompt { color: @fg_dim; }
+.launcher-prompt { color: var(--wakenight-fg-dim); }
 .launcher-row {
     min-height: 36px;
     border-radius: 8px;
     padding: 0 12px;
 }
-.launcher-row.current { background: @bg_alt; }
-.launcher-empty { color: @fg_dim; }
+.launcher-row.current { background: var(--wakenight-bg-alt); }
+.launcher-empty { color: var(--wakenight-fg-dim); }
 
-.backdrop-dim { background: alpha(@bg, 0.55); }
+.backdrop-dim { background: rgb(from var(--wakenight-bg) r g b / 0.55); }
 
 /* Power menu */
 .power-tile {
     min-width: 144px;
     min-height: 144px;
-    background: alpha(@bg_alt, 0.8);
-    border-color: @shadow;
+    background: rgb(from var(--wakenight-bg-alt) r g b / 0.8);
+    border-color: var(--wakenight-shadow);
 }
 .power-tile.current {
-    background: @bg_alt;
-    border-color: @accent;
-    color: @accent;
+    background: var(--wakenight-bg-alt);
+    border-color: var(--wakenight-accent);
+    color: var(--wakenight-accent);
 }
 
 /* Volume popup */
 .osd { padding: 0 18px; }
-.osd.muted-osd { border-color: @bg_alt; color: @fg_dim; }
+.osd.muted-osd { border-color: var(--wakenight-bg-alt); color: var(--wakenight-fg-dim); }
 .osd progressbar trough {
     all: unset;
     min-height: 6px;
     border-radius: 3px;
-    background: @bg_alt;
+    background: var(--wakenight-bg-alt);
 }
 .osd progressbar progress {
     all: unset;
     min-height: 6px;
     border-radius: 3px;
-    background: @accent;
+    background: var(--wakenight-accent);
 }
-.osd.muted-osd progressbar progress { background: @fg_dim; }
+.osd.muted-osd progressbar progress { background: var(--wakenight-fg-dim); }
 
 /* Notifications */
 .notification {
-    background: alpha(@bg, 0.96);
+    background: rgb(from var(--wakenight-bg) r g b / 0.96);
     padding: 13px 17px;
 }
-.notification.low { border-color: @bg_alt; color: @fg_dim; }
-.notification.critical { border-color: @urgent; }
-.notification .app-name { color: @accent; }
-.notification.low .app-name { color: @fg_dim; }
+.notification.low { border-color: var(--wakenight-bg-alt); color: var(--wakenight-fg-dim); }
+.notification.critical { border-color: var(--wakenight-urgent); }
+.notification .app-name { color: var(--wakenight-accent); }
+.notification.low .app-name { color: var(--wakenight-fg-dim); }
 .notification-button {
-    background: @bg_alt;
-    border: 1px solid @bg_alt;
+    background: var(--wakenight-bg-alt);
+    border: 1px solid var(--wakenight-bg-alt);
     border-radius: 6px;
     padding: 4px 12px;
-    color: @fg;
+    color: var(--wakenight-fg);
 }
-.notification-button:hover { border-color: @accent; }
+.notification-button:hover { border-color: var(--wakenight-accent); }
 .notification-more {
-    background: @bg;
-    border: 1px solid @bg_alt;
+    background: var(--wakenight-bg);
+    border: 1px solid var(--wakenight-bg-alt);
     border-radius: 6px;
     padding: 4px 12px;
-    color: @fg_muted;
+    color: var(--wakenight-fg-muted);
 }
 
 /* Share picker */
 .share-tile {
-    background: @bg;
-    border: 3px solid @bg_alt;
+    background: var(--wakenight-bg);
+    border: 3px solid var(--wakenight-bg-alt);
     border-radius: 8px;
     padding: 7px 9px;
 }
 .share-tile:hover {
-    background: @bg_alt;
-    border-color: @accent;
+    background: var(--wakenight-bg-alt);
+    border-color: var(--wakenight-accent);
 }
 .share-preview {
-    background: shade(@bg, 0.8);
+    background: hsl(from var(--wakenight-bg) h calc(s * 0.8) calc(l * 0.8));
     border-radius: 4px;
-    color: @fg_muted;
+    color: var(--wakenight-fg-muted);
 }
+
+/* Transitions (src/anim.rs keeps the exit times in step). What you open most moves least, exits
+ * are faster than entrances, and nothing waits on them: input works from the first frame. */
+.fade.entering, .fade.leaving { opacity: 0; }
+.popover.fade { transition: opacity 100ms ease-out, transform 100ms ease-out; }
+.popover.fade.entering, .popover.fade.leaving { transform: translateY(-4px); }
+.popover.fade.leaving { transition: opacity 60ms ease-in, transform 60ms ease-in; }
+.osd.fade.leaving { transition: opacity 200ms ease-in; }
+/* The backdrop stays transparent until the capture is in, then fades in */
+.backdrop { opacity: 0; }
+.backdrop.ready { opacity: 1; transition: opacity 120ms ease-out; }
+.backdrop.ready.fade.leaving { opacity: 0; transition: opacity 80ms ease-in; }
+.notification { transition: opacity 150ms ease-out, transform 150ms ease-out; }
+.notification.entering, .notification.leaving { opacity: 0; transform: translateX(16px); }
+.notification.leaving { transition: opacity 100ms ease-in, transform 100ms ease-in; }
+
+/* Bar additions */
+.bar-item:hover { color: var(--wakenight-accent); }
+.status .muted-volume { color: var(--wakenight-fg-dim); }
+.status .muted-volume:hover { color: var(--wakenight-accent); }
+
+/* Volume mixer */
+.mixer { padding: 8px 7px 10px; }
+.mixer-row {
+    min-height: 40px;
+    padding: 0 12px;
+}
+.mixer-name { font-size: 13px; }
+.mixer-row.muted-row, .mixer-row.muted-row .mixer-name { color: var(--wakenight-fg-dim); }
+.mixer-mute:hover { color: var(--wakenight-accent); }
+.mixer-device {
+    min-height: 34px;
+    border-radius: 8px;
+    padding: 0 12px;
+    color: var(--wakenight-fg-muted);
+}
+.mixer-device:hover { background: var(--wakenight-bg-alt); }
+.mixer-device.current { color: var(--wakenight-fg); }
+.mixer-device .device-icon { color: var(--wakenight-fg-dim); }
+.mixer-device.current .device-icon, .mixer-device .check { color: var(--wakenight-accent); }
+.mixer-gap { margin: 8px 4px; }
+.mixer scale {
+    all: unset;
+    min-height: 18px;
+}
+.mixer scale trough {
+    all: unset;
+    min-height: 6px;
+    border-radius: 3px;
+    background: var(--wakenight-bg-alt);
+}
+.mixer scale highlight {
+    all: unset;
+    min-height: 6px;
+    border-radius: 3px;
+    background: var(--wakenight-accent);
+}
+.mixer .muted-row scale highlight { background: var(--wakenight-fg-dim); }
+.mixer scale slider {
+    all: unset;
+    min-width: 14px;
+    min-height: 14px;
+    margin: -4px -7px;
+    border-radius: 7px;
+    background: var(--wakenight-fg);
+}
+.mixer .muted-row scale slider { background: var(--wakenight-fg-dim); }

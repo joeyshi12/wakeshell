@@ -52,6 +52,9 @@ pub enum LauncherMsg {
 }
 
 #[derive(Debug)]
+pub struct Shown(pub bool);
+
+#[derive(Debug)]
 pub enum Move {
     Down(usize),
     Up(usize),
@@ -76,7 +79,7 @@ fn key_action(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<LauncherMsg
 impl SimpleComponent for Launcher {
     type Init = Rc<Config>;
     type Input = LauncherMsg;
-    type Output = ();
+    type Output = Shown;
 
     view! {
         util::overlay_window("wakeshell-launcher") -> gtk::Window {
@@ -163,6 +166,7 @@ impl SimpleComponent for Launcher {
                 },
             },
 
+            // No transition: it opens many times a day, so it should be there at once
             #[watch]
             set_visible: model.shown,
         }
@@ -198,7 +202,8 @@ impl SimpleComponent for Launcher {
         }
     }
 
-    fn update(&mut self, msg: LauncherMsg, _sender: ComponentSender<Self>) {
+    fn update(&mut self, msg: LauncherMsg, sender: ComponentSender<Self>) {
+        let was_shown = self.shown;
         match msg {
             LauncherMsg::Open { blocked: false } if !self.shown => self.open(),
             LauncherMsg::Open { .. } => {}
@@ -219,6 +224,9 @@ impl SimpleComponent for Launcher {
                 }
             }
             LauncherMsg::Launch => self.launch_current(),
+        }
+        if self.shown != was_shown {
+            let _ = sender.output(Shown(self.shown));
         }
     }
 }

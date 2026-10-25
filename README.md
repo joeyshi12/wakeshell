@@ -12,8 +12,8 @@ cargo install --locked --git https://github.com/joeyshi12/wakeshell
 ```
 
 This installs to `~/.cargo/bin` (`--path .` installs a local checkout). At runtime it uses `grim`
-(screenshots for the blur and share previews) and `wpctl` (the volume popup). The bar needs dwl
-built with the ipc patch.
+(the blur and share previews) and PipeWire's `wpctl` and `pw-dump` (the volume popup and mixer).
+The bar needs dwl built with the ipc patch.
 
 ## Running
 
@@ -25,8 +25,12 @@ Start `wakeshell` with the session, for example as a systemd user service that i
 | `wakeshell volume up\|down\|mute` | changes the default sink's volume by 5% with wpctl and shows the popup (the volume still changes if the shell is not running) |
 | `wakeshell msg launcher toggle\|open\|close` | the app launcher |
 | `wakeshell msg powermenu toggle\|open\|close` | the power menu |
+| `wakeshell msg mixer toggle\|open\|close` | the volume mixer, under the bar's volume |
 | `wakeshell msg osd volume` | shows the default sink's volume |
 | `wakeshell msg wallpaper reload` | fades to the image the wallpaper link points at now |
+
+In the bar, the volume opens the mixer; scrolling over it changes the volume and a middle click
+mutes.
 
 For screen sharing, set this in `~/.config/xdg-desktop-portal-wlr/config`:
 
@@ -38,11 +42,13 @@ chooser_cmd=wakeshell share-chooser
 
 ## Configuration
 
+Colours are CSS variables, which GTK picks up from `~/.config/gtk-4.0/gtk.css`: `--wakenight-bg`,
+`-bg-alt`, `-accent`, `-fg`, `-fg-dim`, `-fg-muted`, `-urgent` and `-shadow`, set in `:root { }`.
+Unset ones keep the defaults in `src/style.rs`. Sizes and the rest of the look are in
+`src/style.css`.
+
 All files are optional and live in `$XDG_CONFIG_HOME/wakeshell`:
 
-- `colors.css`: the palette, as `@define-color NAME #rrggbb;` for `bg`, `bg_alt`, `accent`, `fg`,
-  `fg_dim`, `fg_muted`, `urgent`, `negative`, `positive` and `shadow`. Sizes and the rest of the
-  look are in `src/style.css`.
 - `wakeshell.conf`: `key = value` lines. Commands are split on spaces.
 
   | Key | Default |

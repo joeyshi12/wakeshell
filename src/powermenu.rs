@@ -5,6 +5,7 @@ use gtk::{gdk, prelude::*};
 use relm4::{RelmWidgetExt, factory::FactoryVecDeque, prelude::*};
 
 use crate::{
+    anim::Fade,
     backdrop,
     config::Config,
     icon::Icon,
@@ -17,6 +18,9 @@ pub struct PowerMenu {
     tiles: FactoryVecDeque<Tile>,
     current: Option<usize>,
     uptime: String,
+    fade: Option<Fade>,
+    /// Picking an action closes at once; Esc fades out
+    instant: bool,
 }
 
 #[derive(Debug)]
@@ -53,6 +57,7 @@ impl SimpleComponent for PowerMenu {
 
     view! {
         util::overlay_window("wakeshell-powermenu") -> gtk::Window {
+            set_visible: false,
             on_key[sender] => move |key, _| {
                 let action = key_action(key);
                 let handled = action.is_some();
@@ -82,9 +87,6 @@ impl SimpleComponent for PowerMenu {
                     },
                 },
             },
-
-            #[watch]
-            set_visible: model.shown,
         }
     }
 
@@ -101,7 +103,15 @@ impl SimpleComponent for PowerMenu {
             tiles.guard().push_back((i, *icon, *label));
         }
         let commands = options.iter().map(|(_, _, command)| (*command).clone()).collect();
-        let model = PowerMenu { commands, shown: false, tiles, current: None, uptime: String::new() };
+        let mut model = PowerMenu {
+            commands,
+            shown: false,
+            tiles,
+            current: None,
+            uptime: String::new(),
+            fade: None,
+            instant: false,
+        };
         let tiles = model.tiles.widget();
         let widgets = view_output!();
 
@@ -113,12 +123,26 @@ impl SimpleComponent for PowerMenu {
         }
         let close = sender.clone();
         widgets.backdrop.on_click_outside(&inside, move || close.input(PowerMenuMsg::Close));
+        model.fade = Some(Fade::new(&root, &widgets.backdrop, false, 80));
         ComponentParts { model, widgets }
     }
 
     fn update(&mut self, msg: PowerMenuMsg, sender: ComponentSender<Self>) {
         let n = self.commands.len();
         let was_shown = self.shown;
+        // Keys still reach it while it fades out, and Enter must not run an action then
+        if !self.shown
+            && matches!(
+                msg,
+                PowerMenuMsg::Hover(_)
+                    | PowerMenuMsg::Next
+                    | PowerMenuMsg::Previous
+                    | PowerMenuMsg::Activate
+                    | PowerMenuMsg::Run(_)
+            )
+        {
+            return;
+        }
         match msg {
             PowerMenuMsg::Open => self.open(),
             PowerMenuMsg::Toggle if self.shown => self.shown = false,
@@ -137,6 +161,13 @@ impl SimpleComponent for PowerMenu {
             PowerMenuMsg::Run(i) => self.run(i),
         }
         if self.shown != was_shown {
+            if let Some(fade) = &self.fade {
+                match (self.shown, std::mem::take(&mut self.instant)) {
+                    (true, _) => fade.show(),
+                    (false, true) => fade.hide_now(),
+                    (false, false) => fade.hide(),
+                }
+            }
             let _ = sender.output(Shown(self.shown));
         }
     }
@@ -158,6 +189,7 @@ impl PowerMenu {
 
     fn run(&mut self, index: usize) {
         self.shown = false;
+        self.instant = true;
         util::spawn(&self.commands[index]);
     }
 

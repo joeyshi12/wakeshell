@@ -1,37 +1,35 @@
-// The stylesheet: colors.css (generated from the dotfiles' palette), then style.css.
+// The stylesheet. Colours are the --wakenight-* variables from ~/.config/gtk-4.0/gtk.css, with the
+// built-in palette underneath for when that file does not set them.
 use gtk::gdk;
 
-use crate::config::config_dir;
-
-const DEFAULT_COLORS: &str = "
-@define-color bg #0f1825;
-@define-color bg_alt #253447;
-@define-color accent #418aa2;
-@define-color fg #e8f4f8;
-@define-color fg_dim #6b8494;
-@define-color fg_muted #96a3ae;
-@define-color urgent #f4d06f;
-@define-color negative #e86e6e;
-@define-color positive #82c896;
-@define-color shadow #05090f;
-";
+const FALLBACK_COLORS: &str = ":root {
+    --wakenight-bg: #0f1825;
+    --wakenight-bg-alt: #253447;
+    --wakenight-accent: #418aa2;
+    --wakenight-fg: #e8f4f8;
+    --wakenight-fg-dim: #6b8494;
+    --wakenight-fg-muted: #96a3ae;
+    --wakenight-urgent: #f4d06f;
+    --wakenight-shadow: #05090f;
+}";
 
 pub fn load() {
     // Automatic font rendering clips the top row of some glyphs with the GPU renderers
     if let Some(settings) = gtk::Settings::default() {
         settings.set_gtk_font_rendering(gtk::FontRendering::Manual);
     }
-    let colors = std::fs::read_to_string(config_dir().join("colors.css")).unwrap_or_default();
-    let css = format!("{DEFAULT_COLORS}\n{colors}\n{}", include_str!("style.css"));
+    let display = gdk::Display::default().expect("display");
+    // Below ~/.config/gtk-4.0/gtk.css, so its variables win
+    add(&display, FALLBACK_COLORS, gtk::STYLE_PROVIDER_PRIORITY_FALLBACK);
+    // Above it, so themes do not restyle the shell
+    add(&display, include_str!("style.css"), gtk::STYLE_PROVIDER_PRIORITY_USER + 10);
+}
+
+fn add(display: &gdk::Display, css: &str, priority: u32) {
     let provider = gtk::CssProvider::new();
     provider.connect_parsing_error(|_, section, error| {
         eprintln!("wakeshell: style: {section}: {error}");
     });
-    provider.load_from_string(&css);
-    // Above ~/.config/gtk-4.0/gtk.css
-    gtk::style_context_add_provider_for_display(
-        &gdk::Display::default().expect("display"),
-        &provider,
-        gtk::STYLE_PROVIDER_PRIORITY_USER + 10,
-    );
+    provider.load_from_string(css);
+    gtk::style_context_add_provider_for_display(display, &provider, priority);
 }

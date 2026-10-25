@@ -11,6 +11,7 @@ use relm4::{RelmWidgetExt, prelude::*};
 use zbus::zvariant::{OwnedValue, Value};
 
 use crate::{
+    anim::Fade,
     backdrop,
     util::{self, Events},
 };
@@ -99,6 +100,9 @@ pub struct Polkit {
     notice_error: bool,
     focus: Cell<bool>,
     _connection: Option<zbus::Connection>,
+    fade: Option<Fade>,
+    /// Closes at once after authenticating; cancelling fades out
+    instant: bool,
 }
 
 #[derive(Debug)]
@@ -148,6 +152,7 @@ impl SimpleComponent for Polkit {
 
     view! {
         util::overlay_window("wakeshell-polkit") -> gtk::Window {
+            set_visible: false,
             on_key[sender] => move |key, _| {
                 let msg = match key {
                     gdk::Key::Escape => PolkitMsg::Cancel,
@@ -255,13 +260,11 @@ impl SimpleComponent for Polkit {
                 },
             },
 
-            #[watch]
-            set_visible: model.flow.is_some(),
         }
     }
 
     fn init(_: (), root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
-        let model = Polkit {
+        let mut model = Polkit {
             queue: VecDeque::new(),
             flow: None,
             generation: Rc::new(Cell::new(0)),
@@ -271,10 +274,13 @@ impl SimpleComponent for Polkit {
             notice_error: false,
             focus: Cell::new(false),
             _connection: None,
+            fade: None,
+            instant: false,
         };
         let widgets = view_output!();
         let cancel = sender.clone();
         widgets.backdrop.on_click_outside(&[widgets.card.clone().upcast()], move || cancel.input(PolkitMsg::Cancel));
+        model.fade = Some(Fade::new(&root, &widgets.backdrop, false, 80));
 
         let (events, receiver) = async_channel::unbounded();
         glib::spawn_future_local(async move {
@@ -331,6 +337,13 @@ impl SimpleComponent for Polkit {
             PolkitMsg::Helper(..) => {}
         }
         if self.flow.is_some() != was_active {
+            if let Some(fade) = &self.fade {
+                match (self.flow.is_some(), std::mem::take(&mut self.instant)) {
+                    (true, _) => fade.show(),
+                    (false, true) => fade.hide_now(),
+                    (false, false) => fade.hide(),
+                }
+            }
             let _ = sender.output(Shown(self.flow.is_some()));
         }
     }
@@ -349,6 +362,8 @@ impl Polkit {
                 let _ = request.done.try_send(false);
                 continue;
             };
+            // The next dialog stays up, so its own close decides how it goes
+            self.instant = false;
             self.flow = Some(Flow {
                 request,
                 username,
@@ -370,6 +385,7 @@ impl Polkit {
 
     fn finish(&mut self, success: bool, sender: &ComponentSender<Self>) {
         if let Some(flow) = self.flow.take() {
+            self.instant = success;
             self.generation.set(self.generation.get() + 1);
             let _ = flow.request.done.try_send(success);
         }

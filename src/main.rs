@@ -1,4 +1,5 @@
 // wakeshell: the desktop shell for dwl. The lock screen is the separate wakelock.
+mod anim;
 mod backdrop;
 mod bar;
 mod config;
@@ -6,9 +7,11 @@ mod dwl;
 mod icon;
 mod ipc;
 mod launcher;
+mod mixer;
 mod monitors;
 mod notifications;
 mod osd;
+mod pipewire;
 mod polkit;
 mod powermenu;
 mod ppm;
@@ -33,6 +36,7 @@ const USAGE: &str = "usage: wakeshell [msg COMMAND... | volume up|down|mute | sh
 Commands for msg:
   launcher toggle|open|close     the app launcher
   powermenu toggle|open|close    the power menu
+  mixer toggle|open|close        the volume mixer, under the bar's volume
   osd volume                     show the default sink's volume for a moment
   wallpaper reload               fade to the image the wallpaper link points at now";
 
@@ -42,12 +46,15 @@ pub struct Shell {
     osd: Controller<osd::Osd>,
     wallpaper: Controller<wallpaper::Wallpaper>,
     sharepicker: Controller<sharepicker::SharePicker>,
-    _bar: Controller<bar::Bar>,
+    mixer: Controller<mixer::Mixer>,
+    bar: Controller<bar::Bar>,
     _notifications: Controller<notifications::Notifications>,
     _polkit: Controller<polkit::Polkit>,
     overlays: HashSet<Overlay>,
+    popups: HashSet<Popup>,
 }
 
+/// Full-screen surfaces that take over until they are done
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Overlay {
     PowerMenu,
@@ -55,10 +62,20 @@ pub enum Overlay {
     SharePicker,
 }
 
+/// Lighter surfaces that close when anything else opens
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Popup {
+    Launcher,
+    Mixer,
+}
+
 #[derive(Debug)]
 pub enum ShellMsg {
     Request(ipc::Request),
     Overlay(Overlay, bool),
+    Popup(Popup, bool),
+    Bar(bar::BarEvent),
+    Audio(pipewire::Audio),
 }
 
 impl Component for Shell {
@@ -74,9 +91,12 @@ impl Component for Shell {
     fn init(requests: Self::Init, _: (), sender: ComponentSender<Self>) -> ComponentParts<Self> {
         let config = Rc::new(Config::load());
         let overlay = |which| move |shown| ShellMsg::Overlay(which, shown);
+        let popup = |which| move |shown| ShellMsg::Popup(which, shown);
         let input = sender.input_sender();
         let shell = Shell {
-            launcher: launcher::Launcher::builder().launch(config.clone()).detach(),
+            launcher: launcher::Launcher::builder()
+                .launch(config.clone())
+                .forward(input, move |launcher::Shown(shown)| popup(Popup::Launcher)(shown)),
             powermenu: powermenu::PowerMenu::builder()
                 .launch(config.clone())
                 .forward(input, move |powermenu::Shown(shown)| overlay(Overlay::PowerMenu)(shown)),
@@ -85,13 +105,19 @@ impl Component for Shell {
             sharepicker: sharepicker::SharePicker::builder()
                 .launch(())
                 .forward(input, move |sharepicker::Shown(shown)| overlay(Overlay::SharePicker)(shown)),
-            _bar: bar::Bar::builder().launch(config).detach(),
+            mixer: mixer::Mixer::builder()
+                .launch(())
+                .forward(input, move |mixer::Shown(shown)| popup(Popup::Mixer)(shown)),
+            bar: bar::Bar::builder().launch(config).forward(input, ShellMsg::Bar),
             _notifications: notifications::Notifications::builder().launch(()).detach(),
             _polkit: polkit::Polkit::builder()
                 .launch(())
                 .forward(input, move |polkit::Shown(shown)| overlay(Overlay::Polkit)(shown)),
             overlays: HashSet::new(),
+            popups: HashSet::new(),
         };
+        let audio = sender.clone();
+        pipewire::watch(move |state| audio.input(ShellMsg::Audio(state)));
         glib::spawn_future_local(async move {
             while let Ok(request) = requests.recv().await {
                 sender.input(ShellMsg::Request(request));
@@ -102,13 +128,28 @@ impl Component for Shell {
 
     fn update(&mut self, msg: ShellMsg, _: ComponentSender<Self>, _: &()) {
         match msg {
-            // Overlays never stack
+            // Overlays never stack, and close any popup
             ShellMsg::Overlay(which, true) => {
                 self.overlays.insert(which);
-                self.launcher.emit(LauncherMsg::Close);
+                self.close_popups(None);
             }
             ShellMsg::Overlay(which, false) => {
                 self.overlays.remove(&which);
+            }
+            ShellMsg::Popup(which, true) => {
+                self.popups.insert(which);
+                self.close_popups(Some(which));
+                if which == Popup::Mixer {
+                    self.osd.emit(osd::OsdMsg::HideNow);
+                }
+            }
+            ShellMsg::Popup(which, false) => {
+                self.popups.remove(&which);
+            }
+            ShellMsg::Bar(event) => self.bar_event(event),
+            ShellMsg::Audio(audio) => {
+                self.mixer.emit(mixer::MixerMsg::Audio(audio.clone()));
+                self.bar.emit(bar::BarMsg::Audio(audio));
             }
             ShellMsg::Request(request) => self.handle(request),
         }
@@ -116,9 +157,50 @@ impl Component for Shell {
 }
 
 impl Shell {
+    /// Every popup but `except`
+    fn close_popups(&self, except: Option<Popup>) {
+        for popup in [Popup::Launcher, Popup::Mixer] {
+            if Some(popup) == except {
+                continue;
+            }
+            match popup {
+                Popup::Launcher => self.launcher.emit(LauncherMsg::Close),
+                Popup::Mixer => self.mixer.emit(mixer::MixerMsg::Close),
+            }
+        }
+    }
+
+    fn bar_event(&self, event: bar::BarEvent) {
+        let blocked = !self.overlays.is_empty();
+        match event {
+            // The bar on another monitor stays clickable under an overlay
+            bar::BarEvent::Popup { .. } if blocked => {}
+            bar::BarEvent::Popup { which: bar::Popup::Mixer, output, right } => {
+                self.mixer.emit(mixer::MixerMsg::Toggle { output: Some(output), right: Some(right) })
+            }
+            bar::BarEvent::Volume(change) => {
+                let Some(steps) = pipewire::volume_steps(change) else { return };
+                let (osd, mixer_shown) = (self.osd.sender().clone(), self.popups.contains(&Popup::Mixer));
+                glib::spawn_future_local(async move {
+                    for step in steps {
+                        let mut argv = vec!["wpctl"];
+                        argv.extend_from_slice(step);
+                        if !util::run(&argv).await {
+                            return;
+                        }
+                    }
+                    if !mixer_shown {
+                        osd.emit(osd::OsdMsg::Volume);
+                    }
+                });
+            }
+        }
+    }
+
     fn handle(&self, request: ipc::Request) {
         let args: Vec<&str> = request.args.iter().map(String::as_str).collect();
         let blocked = !self.overlays.is_empty();
+        let mixer_shown = self.popups.contains(&Popup::Mixer);
         match args.as_slice() {
             ["launcher", "toggle"] => self.launcher.emit(LauncherMsg::Toggle { blocked }),
             ["launcher", "open"] => self.launcher.emit(LauncherMsg::Open { blocked }),
@@ -126,6 +208,12 @@ impl Shell {
             ["powermenu", "toggle"] => self.powermenu.emit(PowerMenuMsg::Toggle),
             ["powermenu", "open"] => self.powermenu.emit(PowerMenuMsg::Open),
             ["powermenu", "close"] => self.powermenu.emit(PowerMenuMsg::Close),
+            ["mixer", "toggle"] if mixer_shown => self.mixer.emit(mixer::MixerMsg::Close),
+            ["mixer", "toggle" | "open"] if !blocked && !mixer_shown => self.bar.emit(bar::BarMsg::Open(bar::Popup::Mixer)),
+            ["mixer", "toggle" | "open"] => {}
+            ["mixer", "close"] => self.mixer.emit(mixer::MixerMsg::Close),
+            // The mixer shows the volume itself
+            ["osd", "volume"] if mixer_shown => {}
             ["osd", "volume"] => self.osd.emit(osd::OsdMsg::Volume),
             ["wallpaper", "reload"] => self.wallpaper.emit(wallpaper::WallpaperMsg::Reload),
             ["sharepicker", sources] => {
@@ -198,15 +286,9 @@ fn msg(args: &[String]) -> ExitCode {
 
 /// Runs in this process rather than the shell, so the volume keys work while the shell is down
 fn volume(change: Option<&str>) -> ExitCode {
-    const SINK: &str = "@DEFAULT_AUDIO_SINK@";
-    let steps: &[&[&str]] = match change {
-        Some("up") => &[&["set-mute", SINK, "0"], &["set-volume", SINK, "5%+", "--limit", "1"]],
-        Some("down") => &[&["set-mute", SINK, "0"], &["set-volume", SINK, "5%-"]],
-        Some("mute") => &[&["set-mute", SINK, "toggle"]],
-        _ => {
-            eprintln!("{USAGE}");
-            return ExitCode::FAILURE;
-        }
+    let Some(steps) = change.and_then(pipewire::volume_steps) else {
+        eprintln!("{USAGE}");
+        return ExitCode::FAILURE;
     };
     for args in steps {
         match std::process::Command::new("wpctl").args(*args).status() {

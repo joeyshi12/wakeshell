@@ -59,6 +59,22 @@ pub trait Events: IsA<gtk::Widget> {
         self.add_controller(click);
     }
 
+    /// Like on_click, but takes the click from the widgets around this one
+    fn on_own_click(&self, f: impl Fn(u32) + 'static) {
+        let click = gtk::GestureClick::new();
+        click.set_button(0);
+        click.connect_pressed(|gesture, _, _, _| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        });
+        click.connect_released(move |gesture, _, x, y| {
+            let widget = gesture.widget().unwrap();
+            if widget.contains(x, y) {
+                f(gesture.current_button());
+            }
+        });
+        self.add_controller(click);
+    }
+
     fn on_left_click(&self, f: impl Fn() + 'static) {
         self.on_click(move |button| {
             if button == 1 {
@@ -100,6 +116,20 @@ pub trait Events: IsA<gtk::Widget> {
             }
         });
         self.add_controller(motion);
+    }
+
+    /// Wheel steps, negative up; touchpads add up to whole steps
+    fn on_scroll(&self, f: impl Fn(f64) + 'static) {
+        let scroll = gtk::EventControllerScroll::new(
+            gtk::EventControllerScrollFlags::VERTICAL | gtk::EventControllerScrollFlags::DISCRETE,
+        );
+        scroll.connect_scroll(move |_, _, dy| {
+            if dy != 0.0 {
+                f(dy);
+            }
+            glib::Propagation::Stop
+        });
+        self.add_controller(scroll);
     }
 
     fn on_hover(&self, f: impl Fn(bool) + 'static) {

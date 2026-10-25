@@ -8,6 +8,7 @@ use crate::{ppm, util};
 
 pub fn new() -> gtk::Overlay {
     let overlay = gtk::Overlay::new();
+    overlay.add_css_class("backdrop");
     let picture = gtk::Picture::new();
     picture.set_content_fit(gtk::ContentFit::Cover);
     picture.set_can_shrink(true);
@@ -22,13 +23,13 @@ pub fn new() -> gtk::Overlay {
     overlay.connect_map(move |overlay| {
         let current = generation.get() + 1;
         generation.set(current);
-        overlay.set_opacity(0.0);
+        overlay.remove_css_class("ready");
         picture.set_paintable(None::<&gdk::Paintable>);
 
         let (timeout, shown, latest) = (overlay.clone(), overlay.clone(), generation.clone());
         glib::timeout_add_local_once(Duration::from_millis(400), move || {
             if latest.get() == current {
-                timeout.set_opacity(1.0);
+                timeout.add_css_class("ready");
             }
         });
         let (picture, latest) = (picture.clone(), generation.clone());
@@ -41,7 +42,7 @@ pub fn new() -> gtk::Overlay {
             if let Some(texture) = texture {
                 picture.set_paintable(Some(&texture));
             }
-            shown.set_opacity(1.0);
+            shown.add_css_class("ready");
         });
     });
     overlay

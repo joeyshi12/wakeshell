@@ -10,13 +10,21 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use relm4::{RelmWidgetExt, factory::FactoryVecDeque, prelude::*};
 use zbus::zvariant::OwnedValue;
 
-use crate::util::{self, Events};
+use crate::{
+    anim,
+    util::{self, Events},
+};
 
 const PATH: &str = "/org/freedesktop/Notifications";
 const INTERFACE: &str = "org.freedesktop.Notifications";
 const MAX_SHOWN: usize = 5;
 const WIDTH: i32 = 360;
 const SHADOW: i32 = 5;
+const GAP: i32 = 10;
+
+// In step with the .notification.leaving transition in style.css
+const LEAVE_MS: u64 = 100;
+const COLLAPSE_MS: u64 = 120;
 
 const LOW: u8 = 0;
 const CRITICAL: u8 = 2;
@@ -133,6 +141,8 @@ pub struct Notifications {
     timers: HashMap<u32, glib::SourceId>,
     hovered: HashSet<u32>,
     hidden: usize,
+    /// For the next popup
+    serial: u64,
     connection: Option<zbus::Connection>,
 }
 
@@ -143,13 +153,18 @@ pub enum NotificationsMsg {
     Close(u32, u32),
     Expired(u32),
     Popup(PopupEvent),
+    /// A closed popup has faded out: close the gap it leaves. By popup serial, since a
+    /// replacement can share the notification id with the popup that is leaving.
+    Collapse(u64),
+    Remove(u64),
 }
 
 #[derive(Debug)]
+/// By popup serial
 pub enum PopupEvent {
-    Clicked(u32, u32),
-    Action(u32, String),
-    Hover(u32, bool),
+    Clicked(u64, u32),
+    Action(u64, String),
+    Hover(u64, bool),
 }
 
 #[relm4::component(pub)]
@@ -172,21 +187,20 @@ impl Component for Notifications {
             set_margin: (Edge::Right, 12),
             set_visible: false,
 
+            // Each popup brings its own gap and shadow room, so the gap collapses with it
             gtk::Box {
                 set_orientation: gtk::Orientation::Vertical,
-                set_spacing: 10,
-                set_size_request: (WIDTH, -1),
-                set_margin_end: SHADOW,
-                set_margin_bottom: SHADOW,
+                set_size_request: (WIDTH + SHADOW, -1),
 
                 #[local_ref]
                 popups -> gtk::Box {
                     set_orientation: gtk::Orientation::Vertical,
-                    set_spacing: 10,
                 },
                 gtk::Label {
                     set_css_classes: &["notification-more", "small"],
                     set_halign: gtk::Align::End,
+                    set_margin_end: SHADOW,
+                    set_margin_bottom: SHADOW,
                     #[watch]
                     set_visible: model.hidden > 0,
                     #[watch]
@@ -204,6 +218,7 @@ impl Component for Notifications {
             timers: HashMap::new(),
             hovered: HashSet::new(),
             hidden: 0,
+            serial: 0,
             connection: None,
         };
         let popups = model.popups.widget();
@@ -238,7 +253,8 @@ impl Component for Notifications {
             NotificationsMsg::Connected(connection) => self.connection = Some(connection),
             NotificationsMsg::Notify(notification) => {
                 let id = notification.id;
-                let position = self.popups.iter().position(|p| p.notification.id == id);
+                let position = self.popups.iter().position(|p| p.notification.id == id && !p.leaving);
+                self.serial += 1;
                 let mut popups = self.popups.guard();
                 match position {
                     Some(i) => {
@@ -247,24 +263,59 @@ impl Component for Notifications {
                         }
                         self.hovered.remove(&id);
                         popups.remove(i);
-                        popups.insert(i, notification);
+                        popups.insert(i, (self.serial, notification));
                     }
                     None => {
-                        popups.push_front(notification);
+                        popups.push_front((self.serial, notification));
                     }
                 }
                 drop(popups);
-                self.refresh(&sender, root);
+                // A replacement can be smaller; a new popup only grows the window
+                self.refresh(&sender, root, position.is_some());
             }
             NotificationsMsg::Close(id, reason) => self.close(id, reason, &sender, root),
+            NotificationsMsg::Collapse(serial) => {
+                if let Some(popup) = self.popups.guard().iter_mut().find(|p| p.serial == serial) {
+                    popup.revealed = false;
+                }
+                let sender = sender.clone();
+                anim::after(COLLAPSE_MS, move || sender.input(NotificationsMsg::Remove(serial)));
+            }
+            NotificationsMsg::Remove(serial) => {
+                let position = self.popups.iter().position(|p| p.serial == serial);
+                if let Some(i) = position {
+                    self.popups.guard().remove(i);
+                    // The last card to leave shrinks the window, so it never cuts another short
+                    let leaving = self.popups.iter().any(|p| p.leaving);
+                    self.refresh(&sender, root, !leaving);
+                }
+            }
             NotificationsMsg::Expired(id) => {
                 // The timer is gone once it fires
                 self.timers.remove(&id);
                 self.close(id, EXPIRED, &sender, root);
             }
-            NotificationsMsg::Popup(PopupEvent::Clicked(id, button)) => match button {
+            // Events from a popup that is leaving are too late
+            NotificationsMsg::Popup(event) => {
+                let serial = match &event {
+                    PopupEvent::Clicked(serial, _) | PopupEvent::Action(serial, _) | PopupEvent::Hover(serial, _) => *serial,
+                };
+                let Some(id) = self.popups.iter().find(|p| p.serial == serial && !p.leaving).map(|p| p.notification.id) else {
+                    return;
+                };
+                self.popup_event(id, event, &sender, root);
+            }
+        }
+    }
+}
+
+impl Notifications {
+    fn popup_event(&mut self, id: u32, event: PopupEvent, sender: &ComponentSender<Self>, root: &gtk::Window) {
+        let sender = sender.clone();
+        match event {
+            PopupEvent::Clicked(_, button) => match button {
                 3 => {
-                    let ids: Vec<u32> = self.popups.iter().map(|p| p.notification.id).collect();
+                    let ids: Vec<u32> = self.popups.iter().filter(|p| !p.leaving).map(|p| p.notification.id).collect();
                     for id in ids {
                         self.close(id, DISMISSED, &sender, root);
                     }
@@ -275,26 +326,24 @@ impl Component for Notifications {
                 1 => self.close(id, DISMISSED, &sender, root),
                 _ => {}
             },
-            NotificationsMsg::Popup(PopupEvent::Action(id, key)) => self.invoke(id, &key, &sender, root),
-            NotificationsMsg::Popup(PopupEvent::Hover(id, true)) => {
+            PopupEvent::Action(_, key) => self.invoke(id, &key, &sender, root),
+            PopupEvent::Hover(_, true) => {
                 self.hovered.insert(id);
                 if let Some(timer) = self.timers.remove(&id) {
                     timer.remove();
                 }
             }
-            NotificationsMsg::Popup(PopupEvent::Hover(id, false)) => {
+            PopupEvent::Hover(_, false) => {
                 self.hovered.remove(&id);
-                if self.popups.iter().any(|p| p.notification.id == id && p.shown) {
+                if self.popups.iter().any(|p| p.notification.id == id && p.shown && !p.leaving) {
                     self.start_timer(id, &sender);
                 }
             }
         }
     }
-}
 
-impl Notifications {
     fn find(&self, id: u32) -> Option<&Notification> {
-        self.popups.iter().map(|p| &p.notification).find(|n| n.id == id)
+        self.popups.iter().filter(|p| !p.leaving).map(|p| &p.notification).find(|n| n.id == id)
     }
 
     fn emit(&self, member: &'static str, body: impl serde::Serialize + zbus::zvariant::DynamicType + 'static) {
@@ -305,14 +354,32 @@ impl Notifications {
     }
 
     fn close(&mut self, id: u32, reason: u32, sender: &ComponentSender<Self>, root: &gtk::Window) {
-        let Some(i) = self.popups.iter().position(|p| p.notification.id == id) else { return };
-        self.popups.guard().remove(i);
+        let Some(i) = self.popups.iter().position(|p| p.notification.id == id && !p.leaving) else { return };
         if let Some(timer) = self.timers.remove(&id) {
             timer.remove();
         }
         self.hovered.remove(&id);
         self.emit("NotificationClosed", (id, reason));
-        self.refresh(sender, root);
+        let mut popups = self.popups.guard();
+        let popup = &mut popups[i];
+        // A card past MAX_SHOWN is not on screen, so it just goes
+        if !popup.shown {
+            popups.remove(i);
+            drop(popups);
+            self.update_shown(sender);
+            // The "more" label may have gone; the window waits if a card is still sliding out
+            if !self.popups.iter().any(|p| p.leaving) {
+                self.refresh(sender, root, true);
+            }
+            return;
+        }
+        // Slide out, then let the cards below move up into the gap. The window and the cards
+        // past MAX_SHOWN wait for Remove, so the leaving card keeps its place until then.
+        popup.leaving = true;
+        let serial = popup.serial;
+        drop(popups);
+        let later = sender.clone();
+        anim::after(LEAVE_MS, move || later.input(NotificationsMsg::Collapse(serial)));
     }
 
     fn invoke(&mut self, id: u32, action: &str, sender: &ComponentSender<Self>, root: &gtk::Window) {
@@ -322,11 +389,27 @@ impl Notifications {
         }
     }
 
-    fn refresh(&mut self, sender: &ComponentSender<Self>, root: &gtk::Window) {
+    fn refresh(&mut self, sender: &ComponentSender<Self>, root: &gtk::Window, shrink: bool) {
+        self.update_shown(sender);
+        if self.popups.is_empty() {
+            return root.set_visible(false);
+        }
+        // Hiding and showing again makes the window shrink to fit what is left. Not otherwise, so
+        // a card that is sliding out is not cut short.
+        if shrink || !root.is_visible() {
+            root.set_visible(false);
+            root.present();
+        }
+    }
+
+    fn update_shown(&mut self, sender: &ComponentSender<Self>) {
         let mut shown = Vec::new();
-        for (i, popup) in self.popups.guard().iter_mut().enumerate() {
-            popup.shown = i < MAX_SHOWN;
-            shown.push((popup.notification.id, popup.shown));
+        // A leaving card keeps its slot until it is removed
+        for (slot, popup) in self.popups.guard().iter_mut().enumerate() {
+            if !popup.leaving {
+                popup.shown = slot < MAX_SHOWN;
+                shown.push((popup.notification.id, popup.shown));
+            }
         }
         for (id, shown) in shown {
             if !shown {
@@ -337,12 +420,7 @@ impl Notifications {
                 self.start_timer(id, sender);
             }
         }
-        self.hidden = self.popups.len().saturating_sub(MAX_SHOWN);
-        // Hiding and showing again makes the window shrink to fit what is left
-        root.set_visible(false);
-        if !self.popups.is_empty() {
-            root.present();
-        }
+        self.hidden = self.popups.iter().filter(|p| !p.leaving && !p.shown).count();
     }
 
     fn start_timer(&mut self, id: u32, sender: &ComponentSender<Self>) {
@@ -366,8 +444,12 @@ impl Notifications {
 }
 
 struct Popup {
+    serial: u64,
     notification: Notification,
     shown: bool,
+    /// Closed, and fading out
+    leaving: bool,
+    revealed: bool,
 }
 
 fn line(text: &str, classes: &[&str]) -> gtk::Label {
@@ -383,26 +465,40 @@ fn line(text: &str, classes: &[&str]) -> gtk::Label {
 
 #[relm4::factory]
 impl FactoryComponent for Popup {
-    type Init = Notification;
+    type Init = (u64, Notification);
     type Input = ();
     type Output = PopupEvent;
     type CommandOutput = ();
     type ParentWidget = gtk::Box;
 
     view! {
-        gtk::Box {
+        // The revealer collapses the gap a closed popup leaves, margin included
+        gtk::Revealer {
+            set_transition_type: gtk::RevealerTransitionType::SlideUp,
+            set_transition_duration: COLLAPSE_MS as u32,
+            #[watch]
+            set_reveal_child: self.revealed,
+            #[watch]
+            set_visible: self.shown,
+
+            #[name = "card"]
+            gtk::Box {
             set_spacing: 12,
             set_css_classes: &["card", "notification"],
             set_class_active: ("low", self.notification.urgency == LOW),
             set_class_active: ("critical", self.notification.urgency == CRITICAL),
-            set_cursor_from_name: Some("pointer"),
             #[watch]
-            set_visible: self.shown,
-            on_click[sender, id = self.notification.id] => move |button| {
-                let _ = sender.output(PopupEvent::Clicked(id, button));
+            set_class_active: ("leaving", self.leaving),
+            #[watch]
+            set_can_target: !self.leaving,
+            set_cursor_from_name: Some("pointer"),
+            set_margin_end: SHADOW,
+            set_margin_bottom: GAP,
+            on_click[sender, serial = self.serial] => move |button| {
+                let _ = sender.output(PopupEvent::Clicked(serial, button));
             },
-            on_hover[sender, id = self.notification.id] => move |inside| {
-                let _ = sender.output(PopupEvent::Hover(id, inside));
+            on_hover[sender, serial = self.serial] => move |inside| {
+                let _ = sender.output(PopupEvent::Hover(serial, inside));
             },
 
             #[name = "text"]
@@ -434,11 +530,12 @@ impl FactoryComponent for Popup {
                     set_visible: self.notification.actions.iter().any(|(key, _)| key != "default"),
                 },
             },
+            },
         }
     }
 
-    fn init_model(notification: Notification, _: &DynamicIndex, _: FactorySender<Self>) -> Self {
-        Popup { notification, shown: true }
+    fn init_model((serial, notification): Self::Init, _: &DynamicIndex, _: FactorySender<Self>) -> Self {
+        Popup { serial, notification, shown: true, leaving: false, revealed: true }
     }
 
     fn init_widgets(
@@ -454,12 +551,13 @@ impl FactoryComponent for Popup {
             image.set_pixel_size(24);
             image.set_valign(gtk::Align::Start);
             image.set_margin_top(2);
-            root.prepend(&image);
+            widgets.card.prepend(&image);
         }
         match markup(&n.body) {
             Some(markup) => widgets.body.set_markup(&markup),
             None => widgets.body.set_text(&strip_tags(&n.body)),
         }
+        anim::enter(widgets.card.upcast_ref());
         for (key, label) in n.actions.iter().filter(|(key, _)| key != "default") {
             let button = gtk::Label::new(Some(label));
             button.set_css_classes(&["notification-button", "small"]);
@@ -469,9 +567,9 @@ impl FactoryComponent for Popup {
             click.connect_pressed(|gesture, _, _, _| {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
             });
-            let (sender, id, key) = (sender.clone(), n.id, key.clone());
+            let (sender, serial, key) = (sender.clone(), self.serial, key.clone());
             click.connect_released(move |_, _, _, _| {
-                let _ = sender.output(PopupEvent::Action(id, key.clone()));
+                let _ = sender.output(PopupEvent::Action(serial, key.clone()));
             });
             button.add_controller(click);
             widgets.actions.insert(&button, -1);

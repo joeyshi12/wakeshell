@@ -5,7 +5,7 @@ use gtk::{glib, prelude::*};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use relm4::{RelmWidgetExt, prelude::*};
 
-use crate::{icon::Icon, util};
+use crate::{anim::Fade, icon::Icon, pipewire, util};
 
 const SHADOW: i32 = 5;
 
@@ -14,6 +14,7 @@ pub struct Osd {
     volume: f64,
     muted: bool,
     hide: Option<glib::SourceId>,
+    fade: Option<Fade>,
 }
 
 #[derive(Debug)]
@@ -21,19 +22,13 @@ pub enum OsdMsg {
     Volume,
     Show(String),
     Hide,
+    /// The mixer shows the volume itself
+    HideNow,
 }
 
 impl Osd {
     fn icon(&self) -> &'static str {
-        if self.muted || self.volume <= 0.0 {
-            "volume-x"
-        } else if self.volume < 0.34 {
-            "volume"
-        } else if self.volume < 0.67 {
-            "volume-1"
-        } else {
-            "volume-2"
-        }
+        pipewire::volume_icon(self.volume, self.muted)
     }
 
     fn text(&self) -> String {
@@ -57,8 +52,7 @@ impl SimpleComponent for Osd {
             exclusive_zone: -1,
         }) -> gtk::Window {
             set_margin: (Edge::Bottom, 80),
-            #[watch]
-            set_visible: model.shown,
+            set_visible: false,
             // Let clicks through to whatever is underneath
             connect_realize => |window| {
                 if let Some(surface) = window.surface() {
@@ -66,6 +60,7 @@ impl SimpleComponent for Osd {
                 }
             },
 
+            #[name = "card"]
             gtk::Box {
                 set_spacing: 12,
                 set_css_classes: &["card", "osd"],
@@ -97,12 +92,15 @@ impl SimpleComponent for Osd {
     }
 
     fn init(_: (), root: Self::Root, _sender: ComponentSender<Self>) -> ComponentParts<Self> {
-        let model = Osd { shown: false, volume: 0.0, muted: false, hide: None };
+        let mut model = Osd { shown: false, volume: 0.0, muted: false, hide: None, fade: None };
         let widgets = view_output!();
+        // At once while the keys are held, fading only once it times out
+        model.fade = Some(Fade::new(&root, &widgets.card, false, 200));
         ComponentParts { model, widgets }
     }
 
     fn update(&mut self, msg: OsdMsg, sender: ComponentSender<Self>) {
+        let was_shown = self.shown;
         match msg {
             OsdMsg::Volume => {
                 let sender = sender.clone();
@@ -128,6 +126,21 @@ impl SimpleComponent for Osd {
                 self.hide = None;
                 self.shown = false;
             }
+            OsdMsg::HideNow => {
+                if let Some(id) = self.hide.take() {
+                    id.remove();
+                }
+                self.shown = false;
+                if let Some(fade) = &self.fade {
+                    fade.hide_now();
+                }
+                return;
+            }
+        }
+        if self.shown != was_shown
+            && let Some(fade) = &self.fade
+        {
+            fade.set(self.shown);
         }
     }
 }
