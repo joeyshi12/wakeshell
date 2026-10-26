@@ -12,6 +12,7 @@ use zbus::zvariant::OwnedValue;
 
 use crate::{
     anim,
+    repaint::RepaintBox,
     util::{self, Events},
 };
 
@@ -188,7 +189,7 @@ impl Component for Notifications {
             set_visible: false,
 
             // Each popup brings its own gap and shadow room, so the gap collapses with it
-            gtk::Box {
+            RepaintBox {
                 set_orientation: gtk::Orientation::Vertical,
                 set_size_request: (WIDTH + SHADOW, -1),
 

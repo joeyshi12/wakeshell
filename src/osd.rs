@@ -5,7 +5,7 @@ use gtk::{glib, prelude::*};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use relm4::{RelmWidgetExt, prelude::*};
 
-use crate::{anim::Fade, icon::Icon, pipewire, util};
+use crate::{anim::Fade, icon::Icon, pipewire, repaint::RepaintBox, util};
 
 const SHADOW: i32 = 5;
 
@@ -61,7 +61,7 @@ impl SimpleComponent for Osd {
             },
 
             #[name = "card"]
-            gtk::Box {
+            RepaintBox {
                 set_spacing: 12,
                 set_css_classes: &["card", "osd"],
                 #[watch]

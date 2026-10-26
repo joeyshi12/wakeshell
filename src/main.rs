@@ -15,6 +15,7 @@ mod pipewire;
 mod polkit;
 mod powermenu;
 mod ppm;
+mod repaint;
 mod sharepicker;
 mod style;
 mod util;

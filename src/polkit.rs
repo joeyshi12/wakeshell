@@ -13,6 +13,7 @@ use zbus::zvariant::{OwnedValue, Value};
 use crate::{
     anim::Fade,
     backdrop,
+    repaint::RepaintBox,
     util::{self, Events},
 };
 
@@ -167,7 +168,7 @@ impl SimpleComponent for Polkit {
             #[wrap(Some)]
             set_child = &backdrop::new() -> gtk::Overlay {
                 #[name = "card"]
-                add_overlay = &gtk::Box {
+                add_overlay = &RepaintBox {
                     set_orientation: gtk::Orientation::Vertical,
                     add_css_class: "card",
                     set_halign: gtk::Align::Center,

@@ -17,6 +17,7 @@ use crate::{
     icon::Icon,
     monitors,
     pipewire::{self, Audio, Device, Stream},
+    repaint::RepaintBox,
     util::{self, Events},
 };
 
@@ -71,7 +72,7 @@ impl SimpleComponent for Mixer {
                 set_vexpand: true,
 
                 #[name = "card"]
-                gtk::Box {
+                RepaintBox {
                     set_orientation: gtk::Orientation::Vertical,
                     set_css_classes: &["card", "popover", "mixer"],
                     set_halign: gtk::Align::End,

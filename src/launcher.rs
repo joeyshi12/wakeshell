@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{Config, state_dir},
+    repaint::RepaintBox,
     util::{self, Events},
 };
 
@@ -90,7 +91,7 @@ impl SimpleComponent for Launcher {
                 set_vexpand: true,
 
                 #[name = "card"]
-                gtk::Box {
+                RepaintBox {
                     set_orientation: gtk::Orientation::Vertical,
                     add_css_class: "card",
                     set_halign: gtk::Align::Center,

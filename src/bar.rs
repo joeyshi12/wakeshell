@@ -15,6 +15,7 @@ use crate::{
     icon::Icon,
     monitors,
     pipewire::{self, Audio},
+    repaint::RepaintBox,
     util::{self, Events},
 };
 
@@ -235,7 +236,6 @@ pub enum Click {
 struct Screen {
     window: gtk::Window,
     state: Option<OutputState>,
-    title_changed: bool,
     hidden: bool,
     status: Status,
     sound: Sound,
@@ -302,7 +302,7 @@ impl SimpleComponent for Screen {
             add_css_class: "bar",
             set_default_size: (-1, HEIGHT),
 
-            gtk::Box {
+            RepaintBox {
                 set_size_request: (-1, HEIGHT),
 
                 gtk::Box {
@@ -340,21 +340,12 @@ impl SimpleComponent for Screen {
                         #[watch]
                         set_visible: model.state.as_ref().is_some_and(|s| s.floating),
                     },
-                    gtk::Overlay {
+                    gtk::Label {
+                        set_ellipsize: gtk::pango::EllipsizeMode::End,
+                        set_xalign: 0.0,
                         set_hexpand: true,
-                        #[wrap(Some)]
-                        set_child = &gtk::Label {
-                            set_ellipsize: gtk::pango::EllipsizeMode::End,
-                            set_xalign: 0.0,
-                            #[watch]
-                            set_label: model.state.as_ref().map_or("", |s| &s.title),
-                        },
-                        // Accent tips draw outside the text's damage; redrawing this repaints them
-                        #[name = "repaint"]
-                        add_overlay = &gtk::DrawingArea {
-                            set_can_target: false,
-                            set_draw_func: |_, _, _, _| {},
-                        },
+                        #[watch]
+                        set_label: model.state.as_ref().map_or("", |s| &s.title),
                     },
                 },
 
@@ -446,7 +437,6 @@ impl SimpleComponent for Screen {
         let mut model = Screen {
             window: root.clone(),
             state: None,
-            title_changed: false,
             hidden: false,
             status: init.status,
             sound: Sound::default(),
@@ -461,12 +451,6 @@ impl SimpleComponent for Screen {
         ComponentParts { model, widgets }
     }
 
-    fn post_view() {
-        if model.title_changed {
-            repaint.queue_draw();
-        }
-    }
-
     // After the last update, so nothing touches the window once it is gone
     fn shutdown(&mut self, _: &mut Self::Widgets, _: relm4::Sender<Self::Output>) {
         self.window.destroy();
@@ -474,16 +458,11 @@ impl SimpleComponent for Screen {
 
     fn update(&mut self, msg: ScreenMsg, sender: ComponentSender<Self>) {
         match msg {
-            ScreenMsg::Sound(sound) => {
-                self.title_changed = false;
-                self.sound = sound;
-            }
+            ScreenMsg::Sound(sound) => self.sound = sound,
             ScreenMsg::Click(click) => {
-                self.title_changed = false;
                 let _ = sender.output(click);
             }
             ScreenMsg::Open(which) => {
-                self.title_changed = false;
                 let Some(volume) = &self.volume else { return };
                 let _ = sender.output(Click::Popup(which, self.right_of(volume)));
             }
@@ -498,13 +477,9 @@ impl SimpleComponent for Screen {
                     tag.urgent = state.is_some_and(|s| s.urgent & bit != 0);
                 }
                 drop(tags);
-                self.title_changed = self.state.as_ref().map(|s| &s.title) != state.as_ref().map(|s| &s.title);
                 self.state = state;
             }
-            ScreenMsg::Status(status) => {
-                self.title_changed = false;
-                self.status = status;
-            }
+            ScreenMsg::Status(status) => self.status = status,
         }
     }
 }
