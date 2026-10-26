@@ -88,6 +88,30 @@ struct Flow {
     failed: bool,
     prompt: String,
     echo: bool,
+    /// PAM messages from the current helper
+    messages: usize,
+    /// Enter was pressed before the helper asked
+    pending: bool,
+}
+
+impl Flow {
+    fn stop_helper(&mut self) {
+        self.helper_input = None;
+        let Some(helper) = self.helper.take() else { return };
+        if let Some(stream) = helper.downcast_ref::<gio::IOStream>() {
+            let _ = stream.close(gio::Cancellable::NONE);
+        } else if let Some(process) = helper.downcast_ref::<gio::Subprocess>() {
+            process.send_signal(libc::SIGTERM);
+        }
+    }
+}
+
+// A helper left waiting for a password only fails once wakeshell exits, and pam_faillock counts
+// that, so several cancelled dialogs could lock the account at the next restart
+impl Drop for Flow {
+    fn drop(&mut self) {
+        self.stop_helper();
+    }
 }
 
 pub struct Polkit {
@@ -133,8 +157,9 @@ impl Polkit {
         let prompt = flow.prompt.trim_end().trim_end_matches(':').trim_end();
         if !flow.waiting {
             "Checking...".into()
-        } else if prompt.is_empty() {
-            "Password".into()
+        } else if prompt.is_empty() || prompt.eq_ignore_ascii_case("password") {
+            // Apps like KeePassXC ask for the login password, not their own
+            format!("Password for {}", flow.username)
         } else {
             prompt.into()
         }
@@ -215,13 +240,13 @@ impl SimpleComponent for Polkit {
                                 set_visibility: model.flow.as_ref().is_some_and(|f| f.echo),
                                 #[watch]
                                 set_placeholder_text: Some(&model.placeholder()),
+                                // Typing can start before the helper asks; Enter waits for it
                                 #[watch]
-                                set_editable: model.flow.as_ref().is_some_and(|f| f.waiting),
+                                set_editable: model.flow.is_some(),
                             },
                         },
                         gtk::Label {
-                            set_wrap: true,
-                            set_wrap_mode: gtk::pango::WrapMode::WordChar,
+                            set_ellipsize: gtk::pango::EllipsizeMode::End,
                             set_xalign: 0.0,
                             set_max_width_chars: 1,
                             set_hexpand: true,
@@ -304,7 +329,8 @@ impl SimpleComponent for Polkit {
 
     fn post_view() {
         if model.focus.take() {
-            input.grab_focus();
+            // Selecting would let the next key replace what was typed before the prompt
+            input.grab_focus_without_selecting();
         }
     }
 
@@ -374,6 +400,8 @@ impl Polkit {
                 failed: false,
                 prompt: String::new(),
                 echo: false,
+                messages: 0,
+                pending: false,
             });
             self.password.set_text("");
             self.notice.clear();
@@ -395,16 +423,36 @@ impl Polkit {
 
     fn submit(&mut self) {
         let Some(flow) = &mut self.flow else { return };
-        let password = self.password.text().to_string();
-        if !flow.waiting || password.is_empty() {
+        if self.password.text().is_empty() {
             return;
         }
+        if !flow.waiting {
+            flow.pending = true;
+            return;
+        }
+        self.send_password();
+    }
+
+    fn send_password(&mut self) {
+        let Some(flow) = &mut self.flow else { return };
         let Some(stdin) = flow.helper_input.clone() else { return };
+        let password = self.password.text().to_string();
         flow.waiting = false;
+        flow.pending = false;
         self.password.set_text("");
         glib::spawn_future_local(async move {
             let _ = stdin.write_all_future(password + "\n", glib::Priority::DEFAULT).await;
         });
+    }
+
+    /// Keeps the notice to one line: a helper's first message, or its first error
+    fn add_notice(&mut self, text: &str, error: bool) {
+        let Some(flow) = &mut self.flow else { return };
+        if flow.messages == 0 || (error && !self.notice_error) {
+            self.notice = text.replace('\n', " ");
+            self.notice_error = error;
+        }
+        flow.messages += 1;
     }
 
     fn set_notice(&mut self, text: &str, error: bool) {
@@ -432,20 +480,23 @@ impl Polkit {
             flow.echo = line.starts_with("PAM_PROMPT_ECHO_ON ");
             flow.prompt = prompt.to_owned();
             flow.waiting = true;
-            self.focus.set(true);
+            if flow.pending {
+                self.send_password();
+            } else {
+                self.focus.set(true);
+            }
         } else if let Some(message) = line.strip_prefix("PAM_ERROR_MSG ") {
-            self.set_notice(message, true);
+            self.add_notice(message, true);
         } else if let Some(message) = line.strip_prefix("PAM_TEXT_INFO ") {
-            self.set_notice(message, false);
+            self.add_notice(message, false);
         } else if line.starts_with("SUCCESS") {
             self.finish(true, sender);
         } else {
-            // Ask again
-            flow.helper = None;
-            flow.helper_input = None;
+            // Ask again. PAM's own messages, like pam_faillock's "The account is locked", say why.
+            flow.stop_helper();
             flow.waiting = false;
             flow.failed = true;
-            if !self.notice_error || self.notice.is_empty() {
+            if flow.messages == 0 {
                 self.set_notice("Wrong password, try again", true);
             }
             self.start_helper(sender);
@@ -453,7 +504,8 @@ impl Polkit {
     }
 
     fn start_helper(&mut self, sender: &ComponentSender<Self>) {
-        let Some(flow) = &self.flow else { return };
+        let Some(flow) = &mut self.flow else { return };
+        flow.messages = 0;
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
         let latest = self.generation.clone();
