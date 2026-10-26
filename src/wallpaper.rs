@@ -1,5 +1,5 @@
-// Wallpaper on every monitor. `wallpaper reload` fades to the image the link points at now.
-use std::{path::PathBuf, rc::Rc, time::Duration};
+// Wallpaper on every monitor, over the background colour. `wallpaper reload` reads the file again.
+use std::{rc::Rc, time::Duration};
 
 use gtk::{gdk, glib, prelude::*};
 use gtk4_layer_shell::{KeyboardMode, Layer, LayerShell};
@@ -65,24 +65,18 @@ impl Wallpaper {
     }
 
     fn reload(&self, sender: ComponentSender<Self>) {
-        let paths: Vec<PathBuf> =
-            std::iter::once(self.config.wallpaper.clone()).chain(self.config.wallpaper_fallback.clone()).collect();
+        let Some(path) = self.config.wallpaper.clone() else {
+            return;
+        };
         let (texture_sender, receiver) = async_channel::bounded(1);
-        std::thread::spawn(move || {
-            let mut texture = None;
-            for path in &paths {
-                match gdk::Texture::from_filename(path) {
-                    Ok(t) => {
-                        texture = Some(t);
-                        break;
-                    }
-                    Err(e) => eprintln!("wakeshell: cannot load the wallpaper {}: {e}", path.display()),
-                }
+        std::thread::spawn(move || match gdk::Texture::from_filename(&path) {
+            Ok(texture) => {
+                let _ = texture_sender.send_blocking(texture);
             }
-            let _ = texture_sender.send_blocking(texture);
+            Err(e) => eprintln!("wakeshell: cannot load the wallpaper {}: {e}", path.display()),
         });
         glib::spawn_future_local(async move {
-            if let Ok(Some(texture)) = receiver.recv().await {
+            if let Ok(texture) = receiver.recv().await {
                 sender.input(WallpaperMsg::Loaded(texture));
             }
         });

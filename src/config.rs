@@ -3,8 +3,7 @@
 use std::{collections::HashMap, fs, path::PathBuf};
 
 pub struct Config {
-    pub wallpaper: PathBuf,
-    pub wallpaper_fallback: Option<PathBuf>,
+    pub wallpaper: Option<PathBuf>,
     /// One icon per dwl tag
     pub tags: Vec<String>,
     /// Index in dwl's layouts[]
@@ -65,13 +64,8 @@ fn words(s: &str) -> Vec<String> {
 
 impl Config {
     pub fn load() -> Config {
-        let data_home = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .unwrap_or_else(|| home().join(".local/share"));
         let mut config = Config {
-            wallpaper: data_home.join("wallpaper"),
-            wallpaper_fallback: None,
+            wallpaper: None,
             tags: words("globe terminal palette message-circle key-round"),
             monocle_layout: 2,
             terminal: words("uwsm-app -- ghostty"),
@@ -102,10 +96,7 @@ impl Config {
         }
         for (key, value) in values {
             match key.as_str() {
-                "wallpaper" => config.wallpaper = expand(&value),
-                "wallpaper_fallback" => {
-                    config.wallpaper_fallback = (!value.is_empty()).then(|| expand(&value))
-                }
+                "wallpaper" => config.wallpaper = (!value.is_empty()).then(|| expand(&value)),
                 "tags" => config.tags = words(&value),
                 "monocle_layout" => match value.parse() {
                     Ok(n) => config.monocle_layout = n,

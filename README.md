@@ -27,7 +27,7 @@ Start `wakeshell` with the session, for example as a systemd user service that i
 | `wakeshell msg powermenu toggle\|open\|close` | the power menu |
 | `wakeshell msg mixer toggle\|open\|close` | the volume mixer, under the bar's volume |
 | `wakeshell msg osd volume` | shows the default sink's volume |
-| `wakeshell msg wallpaper reload` | fades to the image the wallpaper link points at now |
+| `wakeshell msg wallpaper reload` | loads the wallpaper file again and fades to it |
 
 In the bar, the volume opens the mixer; scrolling over it changes the volume and a middle click
 mutes.
@@ -53,8 +53,7 @@ All files are optional and live in `$XDG_CONFIG_HOME/wakeshell`:
 
   | Key | Default |
   |---|---|
-  | `wallpaper` | `~/.local/share/wallpaper` |
-  | `wallpaper_fallback` | none |
+  | `wallpaper` | none (the `--wakenight-bg` colour, also used if the image fails to load) |
   | `tags` | `globe terminal palette message-circle key-round` (one icon per dwl tag) |
   | `monocle_layout` | `2` (index in dwl's `layouts[]`) |
   | `terminal` | `uwsm-app -- ghostty` (middle click on the status) |

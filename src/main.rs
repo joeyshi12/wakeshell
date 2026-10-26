@@ -39,7 +39,7 @@ Commands for msg:
   powermenu toggle|open|close    the power menu
   mixer toggle|open|close        the volume mixer, under the bar's volume
   osd volume                     show the default sink's volume for a moment
-  wallpaper reload               fade to the image the wallpaper link points at now";
+  wallpaper reload               load the wallpaper file again and fade to it";
 
 pub struct Shell {
     launcher: Controller<launcher::Launcher>,
